@@ -1,0 +1,16 @@
+{
+  "name": "telegram-rss-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker that turns a Telegram channel into a key-protected RSS/Atom feed.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "test": "node test/local-test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}
