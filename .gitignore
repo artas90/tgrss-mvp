@@ -5,6 +5,7 @@
 Thumbs.db
 
 wrangler.toml
+.local.txt
 *.log
 
 .wrangler/

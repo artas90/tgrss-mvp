@@ -1,7 +1,7 @@
 # Committed template. `deploy.sh` renders it to wrangler.toml (gitignored),
 # filling in D1_DATABASE_ID from your local .env. Edit THIS file, not wrangler.toml.
 name = "telegram-rss"
-main = "worker.js"
+main = "src/index.js"
 compatibility_date = "2025-06-01"
 
 [[d1_databases]]

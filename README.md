@@ -5,15 +5,17 @@ protected by a key. Posts are stored in **Cloudflare D1**; the public preview pa
 parsed with **HTMLRewriter**.
 
 ```
-https://telegram-rss.<you>.workers.dev/rss/telegram?key=YOUR_KEY
+https://telegram-rss.<account>.workers.dev/rss/telegram?key=YOUR_KEY
 ```
 
 ## Contents
 
 [Secrets](#secrets) · [Quick start](#quick-start) · [Access](#access) ·
 [Live updates](#live-updates-and-private-channels) · [Endpoints](#endpoints) ·
-[Configuration](#configuration) · [Retention](#retention) · [Storage](#storage) ·
-[Local dev](#local-development) · [Notes](#notes) · [Migrating](#migrating-from-the-kv-version)
+[Configuration](#configuration) · [Retention](#retention) ·
+[Older posts](#loading-older-posts) · [Storage](#storage) ·
+[Local dev](#local-development) · [Notes](#notes) ·
+[Troubleshooting](#troubleshooting) · [Migrating](#migrating-from-the-kv-version)
 
 ---
 
@@ -64,8 +66,44 @@ chmod +x deploy.sh
 ./deploy.sh deploy
 ```
 
-`<channel>` in a feed URL can be `@name`, `name`, `t.me/name`, `t.me/c/123456789`, or a
-numeric chat id (`-1001234567890`).
+### Your final feed URL
+
+`./deploy.sh deploy` prints the worker address, `https://<worker-name>.<account>.workers.dev`
+(`telegram-rss` is the worker name from the template). Append the route, the channel and
+your `API_KEY`:
+
+```
+https://telegram-rss.<account>.workers.dev/rss/telegram?key=4f9c1e0b7a2d8c6e3f5a9b1c7d2e4f60a8b3c5d7e9f102132435465768798a9b
+```
+
+| Part | Example | Replace with |
+| --- | --- | --- |
+| worker name | `telegram-rss` | `name` in `wrangler.template.toml` |
+| account subdomain | `<account>` | your Cloudflare workers.dev subdomain (shown at the end of `deploy`); `workers.dev` stays as is |
+| route | `/rss/` | `/rss/`, `/atom/`, or one of the query-style routes |
+| channel | `telegram` | the channel you want |
+| key | `4f9c…` | your `API_KEY` |
+
+For example, with the subdomain `artas90` the host is `telegram-rss.artas90.workers.dev`.
+Paste the full URL into your feed reader. More examples, using `KEY` for the key:
+
+| Goal | URL |
+| --- | --- |
+| RSS | `https://telegram-rss.<account>.workers.dev/rss/telegram?key=KEY` |
+| Atom | `https://telegram-rss.<account>.workers.dev/atom/telegram?key=KEY` |
+| Channel as a query parameter | `https://telegram-rss.<account>.workers.dev/feed.xml?channel=@telegram&key=KEY` |
+| Last 7 days, 20 items | `https://telegram-rss.<account>.workers.dev/rss/telegram?key=KEY&days=7&limit=20` |
+| Private channel (needs the bot) | `https://telegram-rss.<account>.workers.dev/rss/-1001234567890?key=KEY` |
+| Key in a header instead of the URL | `curl -H "Authorization: Bearer KEY" https://telegram-rss.<account>.workers.dev/rss/telegram` |
+| List known channels | `https://telegram-rss.<account>.workers.dev/feeds?key=KEY` |
+
+`<channel>` can be `@name`, `name`, `t.me/name`, `t.me/c/123456789`, or a numeric chat id
+(`-1001234567890`); names are case-insensitive.
+
+**Path form or query form?** `/rss/katimsya?key=…` and `/feed.xml?channel=@Katimsya&key=…`
+return the same feed from the same cache entry. Use the path form by default. The query
+form is for tools that need a fixed path, or for channel references containing slashes
+(for example a pasted `https://t.me/c/123…` link).
 
 ### Keeping `database_id` out of git
 
@@ -115,14 +153,14 @@ Without a bot the worker only sees public channels. With a bot you get instant u
 2. Register the webhook:
 
    ```bash
-   curl -X POST "https://telegram-rss.<you>.workers.dev/admin/setup-webhook?key=YOUR_KEY"
+   curl -X POST "https://telegram-rss.<account>.workers.dev/admin/setup-webhook?key=YOUR_KEY"
    ```
 
    Manual equivalent:
 
    ```bash
    curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
-     -d url="https://telegram-rss.<you>.workers.dev/hook" \
+     -d url="https://telegram-rss.<account>.workers.dev/hook" \
      -d secret_token="<WEBHOOK_SECRET>" \
      -d 'allowed_updates=["channel_post","edited_channel_post"]'
    ```
@@ -201,6 +239,33 @@ edge cache.
 
 ---
 
+## Loading older posts
+
+A feed shows the newest 50 posts of the last `FEED_DAYS` days. To pull in older history:
+
+1. **Raise retention first**, otherwise the nightly cleanup deletes what you backfill.
+   In `wrangler.template.toml` set `FEED_DAYS = "365"` and run `./deploy.sh deploy`.
+2. **Backfill once** (open it in a browser or `curl` it):
+
+   ```
+   https://telegram-rss.<account>.workers.dev/rss/katimsya?key=KEY&refresh=1&pages=10&days=365
+   ```
+
+   `refresh=1` forces a scrape and skips the cache, `pages=10` walks back ten preview
+   pages, and `days=365` is how far back to go (the default stops at `FEED_DAYS`).
+3. **Read it back** with a larger `limit` (max `500`):
+
+   ```
+   https://telegram-rss.<account>.workers.dev/rss/katimsya?key=KEY&days=365&limit=300
+   ```
+
+Limits: a preview page holds about 20 posts and every refresh starts from the newest post,
+so one backfill reaches roughly 200 posts (`pages` is capped at 10 in `handleFeed`). A feed
+reader subscribed to the default URL only ever sees the newest 50 items; older ones appear
+only if the URL asks for them with `limit`.
+
+---
+
 ## Storage
 
 Tables are defined in [`schema.sql`](schema.sql).
@@ -235,12 +300,36 @@ curl "http://localhost:8787/rss/telegram?key=change-me"
 
 ## Notes
 
-- The public preview shows about 20 posts per page; `?refresh=1&pages=N` walks further
-  back.
+- The public preview shows about 20 posts per page; see
+  [Loading older posts](#loading-older-posts) for going further back.
 - Overlapping formatting in webhook posts (for example bold plus italic on the same text)
   is not nested; the first entity wins.
 - `lastBuildDate` is the newest post's date, and `<language>` is omitted.
 - Feeds are sent with `noindex, nofollow`.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| The reader shows the "Telegram → RSS" help text | it fetched `/`, so the URL has no route | subscribe to the full URL: `…/rss/<channel>?key=…` |
+| `401` JSON | missing or wrong key | check `?key=` or the Bearer header against `API_KEY` |
+| `404` "channel not found or has no public preview" | wrong name, or the channel has no public preview | check the username; private channels need the bot |
+| `404` "unknown private channel" | the bot has not received a post from it yet | add the bot as admin, register the webhook, wait for a post |
+| Feed has a title but no items | no posts within `FEED_DAYS` | raise `FEED_DAYS`, or try `&days=365` |
+| `curl` cannot resolve the host but the browser can | local DNS, VPN or proxy difference | `nslookup <host> 1.1.1.1`; `curl --doh-url https://cloudflare-dns.com/dns-query …`; check `env \| grep -i proxy` |
+| `Could not resolve host … alice …` | the README's placeholder was copied | use your own account subdomain: `telegram-rss.<account>.workers.dev` |
+| Photos missing on webhook posts | `BOT_TOKEN` not set, or the media is not a photo | set the secret; only photos are proxied |
+
+To see what is stored for each channel:
+
+```bash
+./deploy.sh d1 execute telegram-rss --remote \
+  --command "SELECT chan, COUNT(*) AS posts, MAX(date) AS newest FROM posts GROUP BY chan"
+```
+
+Live logs: `./deploy.sh tail`.
 
 ---
 
