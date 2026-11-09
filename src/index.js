@@ -1,38 +1,37 @@
 /**
- * Telegram Channel -> RSS  ·  Cloudflare Worker
+ * Telegram Channel -> RSS  ·  Cloudflare Worker  (D1 + HTMLRewriter)
  * ---------------------------------------------------------------
- * Public Telegram channels are exposed as a standard RSS 2.0 / Atom feed.
+ * Sources (auto-fallback):
+ *   1. Bot API webhook (/hook)    -> D1   (bot must be admin of the channel)
+ *   2. Public preview t.me/s/<ch> -> D1   (backfill + channels without bot access)
  *
- *   Data sources (auto-fallback, no configuration needed):
- *     1. Telegram Bot API webhook -> updates land in Workers KV
- *        (requires the bot to be an admin of the channel)
- *     2. Public channel preview   -> https://t.me/s/<username> scraping,
- *        used to backfill history and to serve channels with no bot access
+ * Auth: feed routes need env.API_KEY via ?key= (also ?token= / ?access_token=)
+ *       or "Authorization: Bearer <key>".
+ *       Webhook is guarded by Telegram's X-Telegram-Bot-Api-Secret-Token header
+ *       (= env.WEBHOOK_SECRET).
+ *       Media URLs embedded in feeds are HMAC-signed, so the bot token never leaks.
  *
- *   Protection:
- *     Every feed route requires the predefined key (env.API_KEY), passed as
- *     ?key=..., X-API-Key header, or Authorization: Bearer <key>.
- *     The webhook route is guarded by env.WEBHOOK_SECRET (path segment plus
- *     Telegram's X-Telegram-Bot-Api-Secret-Token header).
+ * Routes
+ *   GET  /                           help
+ *   GET  /health
+ *   GET  /rss/:channel               RSS 2.0         (?key=)
+ *   GET  /atom/:channel              Atom 1.0        (?key=)
+ *   GET  /rss?channel=  | /feed.xml?channel= | /atom?channel=   (?key=)
+ *   GET  /feeds                      known channels  (?key=)
+ *   GET  /media/:fileId?sig=         signed media proxy
+ *   POST /admin/setup-webhook        register webhook (?key=)
+ *   POST /hook                       Telegram webhook sink
  *
- *   Endpoints
- *     GET  /                      help page
- *     GET  /health                health probe
- *     GET  /rss/:channel          RSS 2.0 feed          (?key=)
- *     GET  /atom/:channel         Atom 1.0 feed          (?key=)
- *     GET  /feed.xml?channel=...  RSS alias              (?key=)
- *     GET  /feeds                 known channels         (?key=)
- *     POST /admin/backfill        backfill a channel     (?key=, JSON body)
- *     POST /admin/setup-webhook   register the webhook   (?key=)
- *     POST /hook/:secret          Telegram webhook sink
+ * Feed params: ?limit= ?days= ?pages= ?refresh=1 ?format=atom
+ *   (?refresh=1&pages=N doubles as a backfill)
  */
 
-const DEFAULT_MAX_POSTS = 5000;
+const DEFAULT_MAX_POSTS = 5000; // per channel, enforced by the cron cleanup
 const DEFAULT_CACHE_TTL = 300; // seconds
-const DEFAULT_POST_TTL_DAYS = 30;
 const DEFAULT_LIMIT = 50;
 const DEFAULT_PAGES = 2;
-const DEFAULT_FEED_DAYS = 30;
+const DEFAULT_FEED_DAYS = 30; // feed window and retention
+const WEBHOOK_FRESH_MS = 3600_000;
 
 const RSS_CONTENT_TYPE = 'application/rss+xml; charset=utf-8';
 const ATOM_CONTENT_TYPE = 'application/atom+xml; charset=utf-8';
@@ -61,13 +60,7 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
-function escapeXml(value) {
-  return escapeHtml(value).replace(/'/g, '&apos;');
-}
-
-function escapeAttr(value) {
-  return escapeXml(value);
-}
+const escapeXml = (value) => escapeHtml(value).replace(/'/g, '&apos;');
 
 function cdata(value) {
   return `<![CDATA[${String(value ?? '').replace(/\]\]>/g, ']]]]><![CDATA[>')}]]>`;
@@ -77,31 +70,21 @@ function stripTags(html) {
   return String(html ?? '')
     .replace(/<br\s*\/?>/gi, ' ')
     .replace(/<[^>]*>/g, '')
-    .replace(/&nbsp;/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
+/** &amp; is decoded last so "&amp;lt;" stays "&lt;" */
 function decodeEntities(text) {
   return String(text ?? '')
-    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
     .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')
     .replace(/&gt;/gi, '>')
     .replace(/&quot;/gi, '"')
     .replace(/&apos;/gi, "'")
-    .replace(/&#39;/gi, "'");
-}
-
-/** constant-time-ish comparison, no early exit on content */
-function secretEquals(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
+    .replace(/&amp;/gi, '&');
 }
 
 function num(value, fallback) {
@@ -109,27 +92,59 @@ function num(value, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function safeDecode(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/** compares SHA-256 digests, so neither content nor length leaks */
+async function safeEq(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;
+  const enc = new TextEncoder();
+  const [x, y] = await Promise.all([a, b].map((s) => crypto.subtle.digest('SHA-256', enc.encode(s))));
+  return crypto.subtle.timingSafeEqual(x, y);
+}
+
+/** short HMAC used to sign media URLs */
+async function sign(env, text) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(String(env.API_KEY)),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(text));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+}
+
+const inWindow = (post, cutoff) => {
+  const ts = Date.parse(post.date);
+  return !Number.isFinite(ts) || ts >= cutoff;
+};
+
 /* ------------------------------------------------------------------ */
 /* authorization                                                        */
 /* ------------------------------------------------------------------ */
 
-function candidateKeys(request, url) {
-  const headerKey = request.headers.get('x-api-key') || request.headers.get('x-feed-key');
-  const auth = request.headers.get('authorization') || '';
-  const bearer = /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, '').trim() : '';
-  const queryKey =
-    url.searchParams.get('key') ||
-    url.searchParams.get('token') ||
-    url.searchParams.get('access_token') ||
-    '';
-  return [headerKey, bearer, queryKey].filter(Boolean);
-}
-
-/** true when the request carries the predefined feed key */
-function isAuthorized(request, url, env) {
+async function isAuthorized(request, url, env) {
   const expected = String(env.API_KEY || '').trim();
   if (!expected) return false;
-  return candidateKeys(request, url).some((k) => secretEquals(k, expected));
+
+  const auth = request.headers.get('authorization') || '';
+  const candidates = [
+    /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, '').trim() : '',
+    url.searchParams.get('key'),
+    url.searchParams.get('token'),
+    url.searchParams.get('access_token'),
+  ].filter(Boolean);
+
+  for (const k of candidates) if (await safeEq(k, expected)) return true;
+  return false;
 }
 
 function unauthorized() {
@@ -137,7 +152,7 @@ function unauthorized() {
     {
       ok: false,
       error: 'unauthorized',
-      hint: 'Provide the predefined key via ?key=..., X-API-Key header or Authorization: Bearer <key>.',
+      hint: 'Provide the key via ?key=... or Authorization: Bearer <key>.',
     },
     401,
     { 'www-authenticate': 'Bearer realm="telegram-rss"' },
@@ -145,31 +160,30 @@ function unauthorized() {
 }
 
 /* ------------------------------------------------------------------ */
-/* channel reference parsing                                           */
+/* channel references                                                   */
 /* ------------------------------------------------------------------ */
 
-/**
- * Accepts: @name, name, t.me/name, t.me/s/name, t.me/c/12345, -1001234567890, 12345
- */
+function publicId(id) {
+  const s = String(id ?? '');
+  return s.startsWith('-100') ? s.slice(4) : s.replace(/^-/, '');
+}
+
+/** Accepts: @name, name, t.me/name, t.me/s/name, t.me/c/12345[/678], -1001234567890, 12345 */
 function normalizeChannelRef(raw) {
   let s = String(raw ?? '').trim();
-  s = s.replace(/^https?:\/\/(?:t|telegram)\.me\//i, '');
-  s = s.replace(/^\/+/, '');
-  s = s.replace(/^s\//i, '');
-  s = s.replace(/^c\//i, '');
-  s = s.replace(/^@/, '');
-  s = s.replace(/\/+$/, '');
+  s = s.replace(/^(?:https?:\/\/)?(?:www\.)?(?:t|telegram)\.me\//i, '').replace(/^\/+/, '');
+  s = s.replace(/^s\//i, '').replace(/^c\//i, '').replace(/^@/, '');
+  s = s.split(/[/?#]/)[0];
 
   if (/^-?\d+$/.test(s)) {
-    const chatId = s.startsWith('-100') ? s : `-100${s}`;
-    const publicId = s.startsWith('-100') ? s.slice(4) : s.replace(/^-/, '');
+    const pid = publicId(s);
     return {
       kind: 'numeric',
-      value: s,
-      chatIds: [chatId, publicId],
+      value: pid,
+      chatIds: [`-100${pid}`, pid],
       username: '',
-      link: `https://t.me/c/${publicId}`,
-      previewUrl: `https://t.me/s/c/${publicId}`,
+      link: `https://t.me/c/${pid}`,
+      previewUrl: `https://t.me/s/c/${pid}`,
     };
   }
 
@@ -184,89 +198,122 @@ function normalizeChannelRef(raw) {
   };
 }
 
-/* ------------------------------------------------------------------ */
-/* KV helpers                                                          */
-/* ------------------------------------------------------------------ */
-
-/** canonical storage key: the public username, otherwise the chat id */
+/** canonical storage key: public username, otherwise the numeric channel id */
 function channelKey(chatId, username) {
   const u = String(username || '').trim().toLowerCase();
-  if (u) return u;
-  return `id:${chatId}`;
-}
-
-function postKey(key, messageId) {
-  return `post:${key}:${String(messageId).padStart(12, '0')}`;
-}
-
-function kvOptions(env) {
-  const days = num(env.POST_TTL_DAYS, DEFAULT_POST_TTL_DAYS);
-  const ttl = Math.floor(days * 86400);
-  return ttl >= 60 ? { expirationTtl: ttl } : {};
-}
-
-async function kvGetJson(env, key) {
-  try {
-    const raw = await env.CHANNEL_KV.get(key, 'json');
-    return raw ?? null;
-  } catch {
-    return null;
-  }
-}
-
-async function kvPutJson(env, key, value) {
-  await env.CHANNEL_KV.put(key, JSON.stringify(value), kvOptions(env));
-}
-
-/** resolve a channel reference to a stored channel record (if any) */
-async function findStoredChannel(env, ref) {
-  const keys = [];
-
-  if (ref.kind === 'username') {
-    keys.push(ref.username);
-  } else {
-    for (const chatId of ref.chatIds) {
-      const alias = await kvGetJson(env, `alias:i:${chatId}`);
-      if (typeof alias === 'string' && alias) keys.push(alias);
-      keys.push(`id:${chatId}`);
-    }
-  }
-
-  for (const key of keys) {
-    const meta = await kvGetJson(env, `chan:${key}`);
-    if (meta) return { ...meta, key };
-  }
-  return null;
-}
-
-async function getStoredPosts(env, key, limit) {
-  const ids = await kvGetJson(env, `idx:${key}`);
-  if (!Array.isArray(ids) || ids.length === 0) return [];
-  const slice = ids.slice(-limit);
-  const posts = await Promise.all(slice.map((id) => kvGetJson(env, postKey(key, id))));
-  return posts.filter(Boolean).sort((a, b) => b.id - a.id);
-}
-
-async function listChannels(env) {
-  const out = [];
-  try {
-    let cursor;
-    do {
-      const page = await env.CHANNEL_KV.list({ prefix: 'chan:', limit: 1000, cursor });
-      for (const key of page.keys) {
-        const meta = await kvGetJson(env, key.name);
-        if (meta) out.push(meta);
-      }
-      cursor = page.list_complete ? undefined : page.cursor;
-    } while (cursor);
-  } catch {
-    /* listing is best-effort */
-  }
-  return out.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  return u || `id:${publicId(chatId)}`;
 }
 
 /* ------------------------------------------------------------------ */
-/* Telegram payload normalization                                       */
+/* D1 layer                                                             */
+/* ------------------------------------------------------------------ */
+
+async function batchChunked(env, stmts) {
+  for (let i = 0; i < stmts.length; i += 100) await env.DB.batch(stmts.slice(i, i + 100));
+}
+
+function channelStmt(env, ch, { fetchedAt = null, webhookAt = null } = {}) {
+  return env.DB.prepare(
+    `INSERT INTO channels (key, chat_id, username, title, description, photo, link, fetched_at, webhook_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+     ON CONFLICT(key) DO UPDATE SET
+       chat_id     = COALESCE(NULLIF(excluded.chat_id, ''),    channels.chat_id),
+       username    = COALESCE(NULLIF(excluded.username, ''),   channels.username),
+       title       = COALESCE(NULLIF(excluded.title, ''),      channels.title),
+       description = COALESCE(NULLIF(excluded.description, ''), channels.description),
+       photo       = COALESCE(excluded.photo,                  channels.photo),
+       link        = COALESCE(NULLIF(excluded.link, ''),       channels.link),
+       fetched_at  = COALESCE(excluded.fetched_at,             channels.fetched_at),
+       webhook_at  = COALESCE(excluded.webhook_at,             channels.webhook_at),
+       updated_at  = excluded.updated_at`,
+  ).bind(
+    ch.key,
+    ch.chat_id || '',
+    ch.username || '',
+    ch.title || '',
+    ch.description || '',
+    ch.photo || null,
+    ch.link || '',
+    fetchedAt,
+    webhookAt,
+    Date.now(),
+  );
+}
+
+/** webhook rows always win; preview rows never overwrite a webhook row */
+function postStmt(env, chan, p, fromWebhook) {
+  return env.DB.prepare(
+    `INSERT INTO posts (chan, id, chat_id, date, link, text, html, author, image, file_id, source)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+     ON CONFLICT(chan, id) DO UPDATE SET
+       date    = excluded.date,
+       link    = excluded.link,
+       text    = excluded.text,
+       html    = excluded.html,
+       author  = excluded.author,
+       image   = COALESCE(excluded.image,   posts.image),
+       file_id = COALESCE(excluded.file_id, posts.file_id),
+       source  = excluded.source
+     ${fromWebhook ? '' : "WHERE posts.source <> 'webhook'"}`,
+  ).bind(
+    chan,
+    p.id,
+    p.chat_id || '',
+    p.date,
+    p.link || '',
+    p.text || '',
+    p.html || '',
+    p.author || '',
+    p.image || null,
+    p.file_id || null,
+    p.source,
+  );
+}
+
+async function findChannel(env, ref) {
+  const row =
+    ref.kind === 'username'
+      ? await env.DB.prepare('SELECT * FROM channels WHERE key = ?1').bind(ref.username).first()
+      : await env.DB.prepare('SELECT * FROM channels WHERE key = ?1 OR chat_id = ?2 LIMIT 1')
+          .bind(`id:${ref.value}`, ref.chatIds[0])
+          .first();
+  return row || null;
+}
+
+async function getPosts(env, chan, cutoff, limit) {
+  const { results } = await env.DB.prepare(
+    'SELECT * FROM posts WHERE chan = ?1 AND date >= ?2 ORDER BY id DESC LIMIT ?3',
+  )
+    .bind(chan, new Date(cutoff).toISOString(), limit)
+    .all();
+  return results || [];
+}
+
+async function persistPreview(env, channel, posts) {
+  await batchChunked(env, [
+    channelStmt(env, channel, { fetchedAt: Date.now() }),
+    ...posts.map((p) => postStmt(env, channel.key, p, false)),
+  ]);
+}
+
+/** cron: drop posts outside the retention window and above the per-channel cap */
+async function cleanup(env) {
+  const days = num(env.FEED_DAYS, DEFAULT_FEED_DAYS);
+  const cutoffIso = new Date(Date.now() - days * 86_400_000).toISOString();
+  const max = num(env.MAX_POSTS, DEFAULT_MAX_POSTS);
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM posts WHERE date < ?1').bind(cutoffIso),
+    env.DB.prepare(
+      `DELETE FROM posts WHERE (chan, id) IN (
+         SELECT chan, id FROM (
+           SELECT chan, id, ROW_NUMBER() OVER (PARTITION BY chan ORDER BY id DESC) AS rn FROM posts
+         ) WHERE rn > ?1)`,
+    ).bind(max),
+  ]);
+}
+
+/* ------------------------------------------------------------------ */
+/* Telegram webhook payload                                             */
 /* ------------------------------------------------------------------ */
 
 function renderEntities(text, entities) {
@@ -281,47 +328,23 @@ function renderEntities(text, entities) {
   for (const entity of sorted) {
     const offset = entity.offset || 0;
     const length = entity.length || 0;
-    if (offset < pos || length <= 0) continue;
+    if (offset < pos || length <= 0) continue; // overlapping entities are skipped
     out.push(escapeHtml(source.slice(pos, offset)));
     const frag = source.slice(offset, offset + length);
+    const f = escapeHtml(frag);
 
     switch (entity.type) {
-      case 'bold':
-        out.push(`<b>${escapeHtml(frag)}</b>`);
-        break;
-      case 'italic':
-        out.push(`<i>${escapeHtml(frag)}</i>`);
-        break;
-      case 'underline':
-        out.push(`<u>${escapeHtml(frag)}</u>`);
-        break;
-      case 'strikethrough':
-        out.push(`<s>${escapeHtml(frag)}</s>`);
-        break;
-      case 'code':
-        out.push(`<code>${escapeHtml(frag)}</code>`);
-        break;
-      case 'pre':
-        out.push(`<pre>${escapeHtml(frag)}</pre>`);
-        break;
-      case 'text_link':
-        out.push(`<a href="${escapeAttr(entity.url || '#')}">${escapeHtml(frag)}</a>`);
-        break;
-      case 'mention':
-        out.push(
-          `<a href="https://t.me/${escapeAttr(frag.replace(/^@/, ''))}">${escapeHtml(frag)}</a>`,
-        );
-        break;
-      case 'hashtag':
-        out.push(
-          `<a href="https://t.me/hashtag/${escapeAttr(frag.replace(/^#/, ''))}">${escapeHtml(frag)}</a>`,
-        );
-        break;
-      case 'url':
-        out.push(`<a href="${escapeAttr(frag)}">${escapeHtml(frag)}</a>`);
-        break;
-      default:
-        out.push(escapeHtml(frag));
+      case 'bold': out.push(`<b>${f}</b>`); break;
+      case 'italic': out.push(`<i>${f}</i>`); break;
+      case 'underline': out.push(`<u>${f}</u>`); break;
+      case 'strikethrough': out.push(`<s>${f}</s>`); break;
+      case 'code': out.push(`<code>${f}</code>`); break;
+      case 'pre': out.push(`<pre>${f}</pre>`); break;
+      case 'text_link': out.push(`<a href="${escapeHtml(entity.url || '#')}">${f}</a>`); break;
+      case 'mention': out.push(`<a href="https://t.me/${escapeHtml(frag.replace(/^@/, ''))}">${f}</a>`); break;
+      case 'hashtag': out.push(`<a href="https://t.me/hashtag/${escapeHtml(frag.replace(/^#/, ''))}">${f}</a>`); break;
+      case 'url': out.push(`<a href="${f}">${f}</a>`); break;
+      default: out.push(f);
     }
     pos = offset + length;
   }
@@ -329,56 +352,33 @@ function renderEntities(text, entities) {
   return out.join('');
 }
 
-function pickMedia(msg) {
-  if (Array.isArray(msg.photo) && msg.photo.length) {
-    const best = msg.photo.reduce((a, b) => ((b.width || 0) > (a.width || 0) ? b : a));
-    return { type: 'photo', fileId: best.file_id };
-  }
-  if (msg.video?.file_id) return { type: 'video', fileId: msg.video.file_id };
-  if (msg.animation?.file_id) return { type: 'animation', fileId: msg.animation.file_id };
-  if (msg.audio?.file_id) return { type: 'audio', fileId: msg.audio.file_id };
-  if (msg.document?.file_id) return { type: 'document', fileId: msg.document.file_id };
-  if (msg.sticker?.file_id) return { type: 'sticker', fileId: msg.sticker.file_id };
-  return null;
-}
-
-function buildPostLink(chat, messageId) {
-  if (chat.username) return `https://t.me/${chat.username}/${messageId}`;
-  const raw = String(chat.id ?? '');
-  const publicId = raw.startsWith('-100') ? raw.slice(4) : raw.replace(/^-/, '');
-  return `https://t.me/c/${publicId}/${messageId}`;
-}
-
-function buildChannelLink(chat) {
-  if (chat.username) return `https://t.me/${chat.username}`;
-  const raw = String(chat.id ?? '');
-  const publicId = raw.startsWith('-100') ? raw.slice(4) : raw.replace(/^-/, '');
-  return `https://t.me/c/${publicId}`;
+function channelLink(chat) {
+  return chat.username ? `https://t.me/${chat.username}` : `https://t.me/c/${publicId(chat.id)}`;
 }
 
 function normalizeTelegramPost(msg) {
   const chat = msg.chat || {};
   const text = msg.text || msg.caption || '';
-  const html = renderEntities(text, msg.entities || msg.caption_entities);
+  const photo = Array.isArray(msg.photo) && msg.photo.length
+    ? msg.photo.reduce((a, b) => ((b.width || 0) > (a.width || 0) ? b : a))
+    : null;
+
   return {
     id: Number(msg.message_id),
-    chatId: String(chat.id ?? ''),
+    chat_id: String(chat.id ?? ''),
     date: new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000).toISOString(),
-    link: buildPostLink(chat, msg.message_id),
-    text: decodeEntities(text),
-    html: html || '',
+    link: `${channelLink(chat)}/${msg.message_id}`,
+    text,
+    html: renderEntities(text, msg.entities || msg.caption_entities),
     author: chat.title || chat.username || '',
-    media: pickMedia(msg),
     image: null,
-    imageExpiresAt: 0,
-    views: msg.views ?? null,
-    forwards: msg.forwards ?? null,
+    file_id: photo?.file_id || null, // photos only; served via the signed /media proxy
     source: 'webhook',
   };
 }
 
 /* ------------------------------------------------------------------ */
-/* public preview scraping (t.me/s/<channel>)                           */
+/* preview scraping (t.me/s/<channel>) with HTMLRewriter                */
 /* ------------------------------------------------------------------ */
 
 const ALLOWED_TAGS = new Set([
@@ -386,116 +386,121 @@ const ALLOWED_TAGS = new Set([
   'code', 'pre', 'br', 'span', 'blockquote', 'tg-emoji', 'tg-spoiler',
 ]);
 
-/**
- * Keep a small whitelist of formatting tags, drop everything else while
- * preserving the inner text.
- */
-function sanitizePreviewHtml(html) {
-  return String(html ?? '')
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<\/?([a-zA-Z][a-zA-Z0-9-]*)((?:"[^"]*"|'[^']*'|[^'">])*)>/g, (match, tag, attrs) => {
-      const name = String(tag).toLowerCase();
-      if (!ALLOWED_TAGS.has(name)) return '';
-      if (name === 'a') {
-        const hrefMatch = /href\s*=\s*["']([^"']*)["']/i.exec(attrs || '');
-        const href = hrefMatch ? hrefMatch[1].trim() : '';
-        if (!/^https?:\/\//i.test(href)) {
-          return match.replace(/href\s*=\s*["'][^"']*["']/i, 'href="#"');
-        }
-      }
-      return match;
-    });
-}
+const TEXT_ROOT = '.tgme_widget_message_text:not(.js-message_reply_text)';
+const bgImage = (style) => /url\(['"]?([^'")]+)['"]?\)/i.exec(style || '')?.[1] || null;
 
-function parsePreview(html, ref) {
+/**
+ * Streams the page once. Message body HTML is rebuilt from scratch:
+ * whitelisted tags only, no attributes except a validated https? href on <a>.
+ */
+async function parsePreview(res, ref) {
   const posts = [];
-  const anchors = [];
-  const re = /data-post="([^"]+)"/g;
-  let m;
-  while ((m = re.exec(html))) anchors.push({ raw: m[1], at: m.index });
+  const raw = { title: '', description: '', username: '', photo: null };
+  let cur = null;
+
+  await new HTMLRewriter()
+    .on('.tgme_widget_message[data-post]', {
+      element(el) {
+        const parts = (el.getAttribute('data-post') || '').split('/');
+        const id = Number(parts[parts.length - 1]);
+        if (!id) { cur = null; return; }
+        const isPrivate = parts[0] === 'c' && parts.length >= 3;
+        cur = {
+          id,
+          chat_id: isPrivate ? parts[1] : '',
+          username: !isPrivate && parts.length === 2 ? parts[0] : '',
+          date: '', link: '', html: '', image: null, textState: 0, // 0 idle, 1 open, 2 done
+        };
+        posts.push(cur);
+      },
+    })
+    // permalink + timestamp
+    .on('a.tgme_widget_message_date', {
+      element(el) { if (cur) cur.link = el.getAttribute('href') || ''; },
+    })
+    .on('.tgme_widget_message_date time', {
+      element(el) { if (cur) cur.date = el.getAttribute('datetime') || ''; },
+    })
+    // first image / video thumbnail
+    .on('.tgme_widget_message_photo_wrap, .tgme_widget_message_video_thumb, .tgme_widget_message_roundvideo_thumb', {
+      element(el) { if (cur && !cur.image) cur.image = bgImage(el.getAttribute('style')); },
+    })
+    // message text root: opens/closes capture; text chunks include nested text
+    .on(TEXT_ROOT, {
+      element(el) {
+        const post = cur;
+        if (!post || post.textState !== 0) return;
+        post.textState = 1;
+        el.onEndTag(() => { post.textState = 2; });
+      },
+      text(t) { if (cur?.textState === 1) cur.html += t.text; },
+    })
+    // descendants of the text root: re-emit whitelisted tags without attributes
+    .on(`${TEXT_ROOT} *`, {
+      element(el) {
+        const post = cur;
+        if (!post || post.textState !== 1) return;
+        const name = el.tagName.toLowerCase();
+        if (!ALLOWED_TAGS.has(name)) return;
+
+        let open = `<${name}`;
+        if (name === 'a') {
+          const href = (el.getAttribute('href') || '').trim();
+          if (!/^https?:\/\//i.test(href)) return; // drop internal links, keep their text
+          open += ` href="${escapeHtml(decodeEntities(href))}"`;
+        }
+        post.html += `${open}>`;
+        if (name === 'br') return; // void element
+        el.onEndTag(() => { if (post.textState === 1) post.html += `</${name}>`; });
+      },
+    })
+    // channel header
+    .on('.tgme_channel_info_header_title', { text(t) { raw.title += t.text; } })
+    .on('.tgme_channel_info_description', { text(t) { raw.description += t.text; } })
+    .on('.tgme_channel_info_header_username a', { text(t) { raw.username += t.text; } })
+    .on('.tgme_page_photo_image img', {
+      element(el) { if (!raw.photo) raw.photo = el.getAttribute('src'); },
+    })
+    .transform(res)
+    .text(); // consume the stream
 
   let previewUsername = '';
-
-  for (let i = 0; i < anchors.length; i++) {
-    const start = anchors[i].at;
-    const end = i + 1 < anchors.length ? anchors[i + 1].at : html.length;
-    const chunk = html.slice(start, end);
-
-    // data-post is "<username>/<id>" for public channels and
-    // "c/<chatId>/<id>" for private ones.
-    const parts = anchors[i].raw.split('/');
-    const messageId = Number(parts[parts.length - 1]);
-    if (!Number.isFinite(messageId)) continue;
-
-    const isPrivate = parts.length >= 3 && parts[0] === 'c';
-    const postUsername = !isPrivate && parts.length === 2 ? parts[0] : '';
-    if (postUsername && !previewUsername) previewUsername = postUsername;
-
-    const dateMatch = /<time[^>]*datetime="([^"]+)"/i.exec(chunk);
-    const textMatch =
-      /<div class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/i.exec(chunk);
-    const viewMatch = /tgme_widget_message_views[^>]*>([\s\S]*?)<\/span>/i.exec(chunk);
-    const imgMatch = /background-image\s*:\s*url\(['"]?([^'")]+)['"]?\)/i.exec(chunk);
-    // the permalink lives on the date anchor; the owner link points at the channel
-    const permalinkMatch =
-      /<a[^>]+class="[^"]*tgme_widget_message_date[^"]*"[^>]+href="([^"]+)"/i.exec(chunk) ||
-      /<a[^>]+href="([^"]*\/\d+)"[^>]*class="[^"]*tgme_widget_message_date/i.exec(chunk);
-
-    const rawHtml = textMatch ? sanitizePreviewHtml(textMatch[1]) : '';
-    const plain = decodeEntities(stripTags(rawHtml));
-
-    const permalink = isPrivate
-      ? `https://t.me/c/${parts[1]}/${messageId}`
-      : postUsername
-        ? `https://t.me/${postUsername}/${messageId}`
-        : `${ref.link}/${messageId}`;
-
-    const permalink2 = permalinkMatch ? permalinkMatch[1].trim() : '';
-    const link = /\/\d+$/.test(permalink2) ? permalink2 : permalink;
-
-    posts.push({
-      id: messageId,
-      chatId: isPrivate ? parts[1] : '',
-      date: dateMatch ? new Date(dateMatch[1]).toISOString() : new Date().toISOString(),
-      link,
-      text: plain,
-      html: rawHtml,
+  const out = posts.map((p) => {
+    if (p.username && !previewUsername) previewUsername = p.username;
+    const fallback = p.chat_id
+      ? `https://t.me/c/${p.chat_id}/${p.id}`
+      : p.username
+        ? `https://t.me/${p.username}/${p.id}`
+        : `${ref.link}/${p.id}`;
+    const ts = Date.parse(p.date);
+    return {
+      id: p.id,
+      chat_id: p.chat_id,
+      date: new Date(Number.isFinite(ts) ? ts : Date.now()).toISOString(),
+      link: /^https?:\/\/t\.me\/.+\/\d+$/.test(p.link) ? p.link : fallback,
+      text: decodeEntities(stripTags(p.html)),
+      html: p.html,
       author: '',
-      media: null,
-      image: imgMatch ? imgMatch[1] : null,
-      imageExpiresAt: imgMatch ? Date.now() + 3600_000 : 0,
-      views: viewMatch ? decodeEntities(stripTags(viewMatch[1])) : null,
-      forwards: null,
+      image: p.image,
+      file_id: null,
       source: 'preview',
-    });
-  }
+    };
+  });
 
-  const titleMatch =
-    /tgme_channel_info_header_title[^>]*>\s*<span[^>]*>([\s\S]*?)<\/span>/i.exec(html) ||
-    /tgme_channel_info_header_title[^>]*>([\s\S]*?)<\/div>/i.exec(html);
-  const descMatch = /tgme_channel_info_description[^>]*>([\s\S]*?)<\/div>/i.exec(html);
-  const userMatch = /tgme_channel_info_header_username[^>]*>\s*<span[^>]*>([\s\S]*?)<\/span>/i.exec(html);
-  // the logo is either an <img> inside .tgme_page_photo_image or a background-image
-  const logoMatch =
-    /<i class="tgme_page_photo_image[^"]*"[^>]*>\s*<img[^>]+src="([^"]+)"/i.exec(html) ||
-    /tgme_channel_info_header_image[^>]*background-image\s*:\s*url\(['"]?([^'")]+)['"]?\)/i.exec(html);
-
-  const headerUser = userMatch ? decodeEntities(stripTags(userMatch[1])).replace(/^@/, '') : '';
-
-  const meta = {
-    title: titleMatch ? decodeEntities(stripTags(titleMatch[1])) : '',
-    description: descMatch ? decodeEntities(stripTags(descMatch[1])) : '',
-    photo: logoMatch ? logoMatch[1] : null,
-    username: previewUsername || headerUser.toLowerCase(),
+  return {
+    posts: out,
+    meta: {
+      title: decodeEntities(stripTags(raw.title)),
+      description: decodeEntities(stripTags(raw.description)),
+      photo: raw.photo,
+      username: previewUsername || decodeEntities(stripTags(raw.username)).replace(/^@/, '').toLowerCase(),
+    },
   };
-
-  return { posts, meta };
 }
 
 async function fetchPreview(ref, pages, cutoff) {
-  const collected = [];
-  let meta = {};
+  const byId = new Map();
+  let meta = { title: '', description: '', photo: null, username: '' };
   let url = ref.previewUrl;
 
   for (let page = 0; page < pages; page++) {
@@ -503,8 +508,7 @@ async function fetchPreview(ref, pages, cutoff) {
     try {
       res = await fetch(url, {
         headers: {
-          'user-agent':
-            'Mozilla/5.0 (compatible; TelegramRssWorker/1.0; +https://workers.dev)',
+          'user-agent': 'Mozilla/5.0 (compatible; TelegramRssWorker/2.0; +https://workers.dev)',
           accept: 'text/html,application/xhtml+xml',
         },
       });
@@ -513,157 +517,32 @@ async function fetchPreview(ref, pages, cutoff) {
     }
     if (!res.ok) break;
 
-    const html = await res.text();
-    const parsed = parsePreview(html, ref);
+    const parsed = await parsePreview(res, ref);
     if (!parsed.posts.length) break;
+    if (page === 0) meta = parsed.meta;
+    for (const p of parsed.posts) byId.set(p.id, p);
 
-    meta = { ...parsed.meta, ...meta };
-    collected.push(...parsed.posts);
-
-    const oldest = parsed.posts[parsed.posts.length - 1];
-    // the page is already older than the retention window -> no reason to paginate further
-    if (cutoff && Date.parse(oldest.date) < cutoff) break;
-    if (!oldest.id) break;
+    // Telegram lists oldest -> newest on a page: continue from the *smallest* id
+    const oldest = parsed.posts.reduce((a, b) => (b.id < a.id ? b : a));
+    if (Date.parse(oldest.date) < cutoff) break;
     url = `${ref.previewUrl}?before=${oldest.id}`;
   }
 
-  const seen = new Set();
-  const posts = collected
-    .filter((p) => (seen.has(p.id) ? false : (seen.add(p.id), true)))
-    .filter((p) => !cutoff || isWithinWindow(p, cutoff))
-    .sort((a, b) => b.id - a.id);
-
-  return { posts, meta };
+  return { posts: [...byId.values()].filter((p) => inWindow(p, cutoff)), meta };
 }
 
-/** true when a post is newer than the cutoff timestamp */
-function isWithinWindow(post, cutoff) {
-  const ts = Date.parse(post?.date || '');
-  return !Number.isFinite(ts) ? true : ts >= cutoff;
-}
-
-/* ------------------------------------------------------------------ */
-/* persistence                                                          */
-/* ------------------------------------------------------------------ */
-
-/** merge webhook posts and preview posts, webhook data wins */
-function mergePosts(storedPosts, previewPosts) {
-  const map = new Map();
-  for (const p of previewPosts) map.set(p.id, { ...p });
-  for (const p of storedPosts) {
-    const base = map.get(p.id) || {};
-    map.set(p.id, {
-      ...base,
-      ...p,
-      text: p.text || base.text || '',
-      html: p.html || base.html || '',
-      link: p.link || base.link || '',
-      media: p.media || base.media || null,
-      image: p.image || base.image || null,
-      imageExpiresAt: p.imageExpiresAt || base.imageExpiresAt || 0,
-    });
-  }
-  return [...map.values()].sort((a, b) => b.id - a.id);
-}
-
-async function persistPosts(env, channel, posts, cutoff) {
-  const key = channelKey(channel.id, channel.username);
-  const max = num(env.MAX_POSTS, DEFAULT_MAX_POSTS);
-
-  // never store posts older than the retention window
-  const fresh = posts.filter((p) => !cutoff || isWithinWindow(p, cutoff));
-  const ids = fresh.map((p) => p.id).sort((a, b) => a - b).slice(-max);
-
-  for (const post of fresh) {
-    await kvPutJson(env, postKey(key, post.id), { ...post, key });
-  }
-
-  const existing = await kvGetJson(env, `idx:${key}`);
-  const merged = new Set([...(Array.isArray(existing) ? existing : []), ...ids]);
-  const mergedList = [...merged].sort((a, b) => a - b).slice(-max);
-  await kvPutJson(env, `idx:${key}`, mergedList);
-
-  await kvPutJson(env, `chan:${key}`, {
-    id: channel.id ?? '',
-    key,
-    title: channel.title || 'Telegram channel',
-    username: channel.username || '',
-    description: channel.description || '',
-    photo: channel.photo || null,
-    link: channel.link || '',
-    updatedAt: Date.now(),
-  });
-
-  if (channel.id && /^-?\d+$/.test(String(channel.id))) {
-    await kvPutJson(env, `alias:i:${channel.id}`, key);
-  }
-}
-
-async function persistWebhookPost(env, msg, ctx) {
-  const chat = msg.chat || {};
-  const key = channelKey(chat.id, chat.username);
-  const post = normalizeTelegramPost(msg);
-
-  await kvPutJson(env, postKey(key, post.id), { ...post, key });
-
-  const idxKey = `idx:${key}`;
-  const existing = await kvGetJson(env, idxKey);
-  const ids = new Set(Array.isArray(existing) ? existing : []);
-  ids.add(post.id);
-  const max = num(env.MAX_POSTS, DEFAULT_MAX_POSTS);
-  const list = [...ids].sort((a, b) => a - b).slice(-max);
-  await kvPutJson(env, idxKey, list);
-
-  await kvPutJson(env, `chan:${key}`, {
-    id: String(chat.id ?? ''),
-    key,
-    title: chat.title || 'Telegram channel',
-    username: chat.username || '',
-    description: chat.description || '',
-    photo: null,
-    link: buildChannelLink(chat),
-    updatedAt: Date.now(),
-  });
-
-  await kvPutJson(env, `alias:i:${chat.id}`, key);
-
-  if (ctx && env.BOT_TOKEN && env.RESOLVE_MEDIA !== '0' && post.media?.fileId) {
-    ctx.waitUntil(resolveMedia(env, key, post.id));
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* media resolution (bot token required)                               */
-/* ------------------------------------------------------------------ */
-
-async function resolveMedia(env, key, messageId) {
-  if (!env.BOT_TOKEN) return;
-  const post = await kvGetJson(env, postKey(key, messageId));
-  if (!post?.media?.fileId) return;
-
-  try {
-    const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${encodeURIComponent(post.media.fileId)}`;
-    const res = await fetch(url);
-    const payload = await res.json();
-    const filePath = payload?.result?.file_path;
-    if (!filePath) return;
-    post.image = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`;
-    post.imageExpiresAt = Date.now() + 45 * 60_000;
-    await kvPutJson(env, postKey(key, messageId), post);
-  } catch {
-    /* media resolution is best-effort */
-  }
-}
-
-async function refreshStaleMedia(env, posts, ctx) {
-  if (!env.BOT_TOKEN || env.RESOLVE_MEDIA === '0' || !ctx) return;
-  const now = Date.now();
-  const stale = posts
-    .filter((p) => p.media?.fileId && (!p.image || p.imageExpiresAt < now))
-    .slice(0, 12);
-  for (const post of stale) {
-    ctx.waitUntil(resolveMedia(env, post.key, post.id));
-  }
+function buildChannel(preview, stored, ref) {
+  const username = preview.meta.username || stored?.username || ref.username;
+  const chat_id = stored?.chat_id || (ref.kind === 'numeric' ? ref.chatIds[0] : '');
+  return {
+    key: stored?.key || channelKey(chat_id, username),
+    chat_id,
+    username,
+    title: preview.meta.title || stored?.title || `@${ref.username || ref.value}`,
+    description: preview.meta.description || stored?.description || '',
+    photo: preview.meta.photo || stored?.photo || null,
+    link: stored?.link || ref.link,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -676,25 +555,29 @@ function itemTitle(post) {
   return text.length > 120 ? `${text.slice(0, 117)}...` : text;
 }
 
+function itemBody(post) {
+  const img = post.image ? `<p><img src="${escapeHtml(post.image)}" alt=""></p>` : '';
+  return img + (post.html || escapeHtml(post.text || ''));
+}
+
 function renderRss(channel, posts, selfUrl) {
   const title = channel.title || 'Telegram channel';
-  const description = channel.description || `Telegram channel feed — ${title}`;
   const link = channel.link || 'https://t.me';
+  const description = channel.description || `Telegram channel feed — ${title}`;
+  const built = posts.length ? new Date(posts[0].date) : new Date();
 
-  const parts = [];
-  parts.push('<?xml version="1.0" encoding="UTF-8"?>');
-  parts.push(
+  const parts = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
     '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:media="http://search.yahoo.com/mrss/">',
-  );
-  parts.push('<channel>');
-  parts.push(`<title>${escapeXml(title)}</title>`);
-  parts.push(`<link>${escapeXml(link)}</link>`);
-  parts.push(`<description>${escapeXml(description)}</description>`);
-  parts.push('<language>en</language>');
-  parts.push(`<lastBuildDate>${new Date().toUTCString()}</lastBuildDate>`);
-  parts.push('<generator>telegram-rss-worker</generator>');
-  parts.push(`<atom:link href="${escapeXml(selfUrl)}" rel="self" type="application/rss+xml"/>`);
-  parts.push(`<atom:link href="${escapeXml(link)}" rel="alternate" type="text/html"/>`);
+    '<channel>',
+    `<title>${escapeXml(title)}</title>`,
+    `<link>${escapeXml(link)}</link>`,
+    `<description>${escapeXml(description)}</description>`,
+    `<lastBuildDate>${built.toUTCString()}</lastBuildDate>`,
+    '<generator>telegram-rss-worker</generator>',
+    `<atom:link href="${escapeXml(selfUrl)}" rel="self" type="application/rss+xml"/>`,
+    `<atom:link href="${escapeXml(link)}" rel="alternate" type="text/html"/>`,
+  ];
   if (channel.photo) {
     parts.push(
       `<image><url>${escapeXml(channel.photo)}</url><title>${escapeXml(title)}</title><link>${escapeXml(link)}</link></image>`,
@@ -702,54 +585,55 @@ function renderRss(channel, posts, selfUrl) {
   }
 
   for (const post of posts) {
-    const body = post.html ? post.html : escapeHtml(post.text || '');
-    const plain = post.text ? escapeHtml(post.text) : body;
-    parts.push('<item>');
-    parts.push(`<title>${escapeXml(itemTitle(post))}</title>`);
-    parts.push(`<link>${escapeXml(post.link)}</link>`);
-    parts.push(`<guid isPermaLink="true">${escapeXml(post.link)}</guid>`);
-    parts.push(`<pubDate>${new Date(post.date).toUTCString()}</pubDate>`);
-    parts.push(`<description>${cdata(plain)}</description>`);
-    parts.push(`<content:encoded>${cdata(body)}</content:encoded>`);
-    parts.push(`<dc:creator>${escapeXml(post.author || title)}</dc:creator>`);
-    if (post.image) {
-      parts.push(`<media:content url="${escapeXml(post.image)}" medium="image"/>`);
-      parts.push(`<enclosure url="${escapeXml(post.image)}" type="image/jpeg" length="0"/>`);
-    }
+    parts.push(
+      '<item>',
+      `<title>${escapeXml(itemTitle(post))}</title>`,
+      `<link>${escapeXml(post.link)}</link>`,
+      `<guid isPermaLink="true">${escapeXml(post.link)}</guid>`,
+      `<pubDate>${new Date(post.date).toUTCString()}</pubDate>`,
+      `<description>${cdata(escapeHtml(post.text || ''))}</description>`,
+      `<content:encoded>${cdata(itemBody(post))}</content:encoded>`,
+      `<dc:creator>${escapeXml(post.author || title)}</dc:creator>`,
+    );
+    if (post.image) parts.push(`<media:content url="${escapeXml(post.image)}" medium="image"/>`);
     parts.push('</item>');
   }
 
-  parts.push('</channel>');
-  parts.push('</rss>');
+  parts.push('</channel>', '</rss>');
   return parts.join('\n');
 }
 
 function renderAtom(channel, posts, selfUrl) {
   const title = channel.title || 'Telegram channel';
   const link = channel.link || 'https://t.me';
-  const updated = posts.length ? new Date(posts[0].date).toISOString() : new Date().toISOString();
+  const updated = (posts.length ? new Date(posts[0].date) : new Date()).toISOString();
 
-  const parts = [];
-  parts.push('<?xml version="1.0" encoding="UTF-8"?>');
-  parts.push('<feed xmlns="http://www.w3.org/2005/Atom">');
-  parts.push(`<title>${escapeXml(title)}</title>`);
-  parts.push(`<subtitle>${escapeXml(channel.description || '')}</subtitle>`);
-  parts.push(`<link href="${escapeXml(selfUrl)}" rel="self"/>`);
-  parts.push(`<link href="${escapeXml(link)}" rel="alternate"/>`);
-  parts.push(`<updated>${updated}</updated>`);
-  parts.push('<generator>telegram-rss-worker</generator>');
+  const parts = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<feed xmlns="http://www.w3.org/2005/Atom">',
+    `<id>${escapeXml(link)}</id>`,
+    `<title>${escapeXml(title)}</title>`,
+    `<subtitle>${escapeXml(channel.description || '')}</subtitle>`,
+    `<link href="${escapeXml(selfUrl)}" rel="self"/>`,
+    `<link href="${escapeXml(link)}" rel="alternate"/>`,
+    `<updated>${updated}</updated>`,
+    '<generator>telegram-rss-worker</generator>',
+  ];
 
   for (const post of posts) {
-    parts.push('<entry>');
-    parts.push(`<title>${escapeXml(itemTitle(post))}</title>`);
-    parts.push(`<link href="${escapeXml(post.link)}"/>`);
-    parts.push(`<id>${escapeXml(post.link)}</id>`);
-    parts.push(`<updated>${new Date(post.date).toISOString()}</updated>`);
-    parts.push(`<published>${new Date(post.date).toISOString()}</published>`);
-    parts.push(`<author><name>${escapeXml(post.author || title)}</name></author>`);
-    parts.push(`<content type="html">${cdata(post.html || escapeHtml(post.text || ''))}</content>`);
-    parts.push(`<summary>${cdata(post.text || '')}</summary>`);
-    parts.push('</entry>');
+    const iso = new Date(post.date).toISOString();
+    parts.push(
+      '<entry>',
+      `<title>${escapeXml(itemTitle(post))}</title>`,
+      `<link href="${escapeXml(post.link)}"/>`,
+      `<id>${escapeXml(post.link)}</id>`,
+      `<updated>${iso}</updated>`,
+      `<published>${iso}</published>`,
+      `<author><name>${escapeXml(post.author || title)}</name></author>`,
+      `<content type="html">${cdata(itemBody(post))}</content>`,
+      `<summary>${cdata(post.text || '')}</summary>`,
+      '</entry>',
+    );
   }
 
   parts.push('</feed>');
@@ -760,99 +644,108 @@ function renderAtom(channel, posts, selfUrl) {
 /* routes                                                               */
 /* ------------------------------------------------------------------ */
 
-async function handleFeed(request, env, ctx, url, channelRaw, format) {
-  const ref = normalizeChannelRef(channelRaw);
+const cacheRequest = (origin, format, value) =>
+  new Request(`${origin}/__cache/${format}/${encodeURIComponent(value)}`);
+
+async function handleFeed(env, ctx, url, route) {
+  const ref = normalizeChannelRef(route.channel);
   if (!ref.value) return json({ ok: false, error: 'missing channel' }, 400);
+  const format = route.format;
 
-  const limit = num(url.searchParams.get('limit'), DEFAULT_LIMIT);
-  const pages = num(url.searchParams.get('pages'), DEFAULT_PAGES);
+  const limit = Math.min(num(url.searchParams.get('limit'), DEFAULT_LIMIT), 500);
+  const pages = Math.min(num(url.searchParams.get('pages'), DEFAULT_PAGES), 10);
   const force = url.searchParams.get('refresh') === '1';
-
-  // retention window: only posts newer than this are exposed
   const defaultDays = num(env.FEED_DAYS, DEFAULT_FEED_DAYS);
   const days = num(url.searchParams.get('days'), defaultDays);
   const cutoff = Date.now() - days * 86_400_000;
-  // only the default variant is cached, so a webhook can purge it exactly
-  const cacheable = days === defaultDays && limit === DEFAULT_LIMIT;
 
-  const stored = await findStoredChannel(env, ref);
-  let channel = stored;
-  // over-fetch a little so the date filter cannot starve the feed
-  let posts = stored?.key ? await getStoredPosts(env, stored.key, Math.min(limit * 2, 500)) : [];
-  posts = posts.filter((p) => isWithinWindow(p, cutoff)).slice(0, limit);
-
-  // Fallback / backfill from the public channel preview.
-  if (force || posts.length === 0) {
-    const preview = await fetchPreview(ref, pages, cutoff);
-    const merged = mergePosts(posts, preview.posts).filter((p) => isWithinWindow(p, cutoff));
-    posts = merged.slice(0, limit);
-
-    const username = preview.meta.username || stored?.username || ref.username;
-    const chatId = stored?.id || (ref.kind === 'numeric' ? ref.chatIds[0] : '');
-    channel = {
-      id: chatId,
-      key: stored?.key || channelKey(chatId, username),
-      username,
-      title: preview.meta.title || stored?.title || `@${ref.username || ref.value}`,
-      description: preview.meta.description || stored?.description || '',
-      photo: preview.meta.photo || stored?.photo || null,
-      link: stored?.link || ref.link,
-    };
-
-    ctx.waitUntil(persistPosts(env, channel, merged, cutoff).catch(() => {}));
+  // only the default variant is cached so a webhook can purge it exactly
+  const cacheable = !force && days === defaultDays && limit === DEFAULT_LIMIT;
+  const cacheKey = cacheRequest(url.origin, format, ref.value);
+  if (cacheable) {
+    const hit = await caches.default.match(cacheKey);
+    if (hit) return hit;
   }
 
-  refreshStaleMedia(env, posts, ctx);
+  let channel = await findChannel(env, ref);
+  let posts = channel ? await getPosts(env, channel.key, cutoff, limit) : [];
 
-  const selfUrl = `${url.origin}${url.pathname}${format === 'atom' ? '?format=atom' : ''}`;
-  const body =
-    format === 'atom' ? renderAtom(channel, posts, selfUrl) : renderRss(channel, posts, selfUrl);
+  // scrape when forced, empty, or stale -- unless a webhook is keeping the channel fresh
+  const now = Date.now();
+  const ttlMs = num(env.CACHE_TTL, DEFAULT_CACHE_TTL) * 1000;
+  const webhookFresh = channel?.webhook_at && now - channel.webhook_at < WEBHOOK_FRESH_MS;
+  const scrapeStale = !channel?.fetched_at || now - channel.fetched_at > ttlMs;
 
-  const ttl = num(env.CACHE_TTL, DEFAULT_CACHE_TTL);
-  const headers = {
-    'content-type': format === 'atom' ? ATOM_CONTENT_TYPE : RSS_CONTENT_TYPE,
-    'cache-control': `public, max-age=${ttl}`,
-    'x-robots-tag': 'noindex, nofollow',
-  };
+  // private channels (no username) have no public preview: they only exist via the webhook
+  const isPrivate = ref.kind === 'numeric' && !channel?.username;
 
-  const cacheKey = new Request(`${url.origin}${url.pathname}?format=${format}`, { method: 'GET' });
-  const cache = caches.default;
-
-  // ?refresh=1 bypasses (and does not populate) the cache; so do custom variants.
-  if (!force && cacheable) {
-    const cached = await cache.match(cacheKey);
-    if (cached) return cached;
+  if (!isPrivate && (force || !posts.length || (!webhookFresh && scrapeStale))) {
+    // a numeric ref to a channel with a known username scrapes via the username
+    const scrapeRef = channel?.username ? normalizeChannelRef(channel.username) : ref;
+    const preview = await fetchPreview(scrapeRef, pages, cutoff);
+    if (preview.posts.length || preview.meta.title) {
+      channel = buildChannel(preview, channel, ref);
+      await persistPreview(env, channel, preview.posts);
+      posts = await getPosts(env, channel.key, cutoff, limit);
+    } else if (!channel) {
+      return json({ ok: false, error: 'channel not found or has no public preview' }, 404);
+    }
   }
 
-  const response = new Response(body, { headers });
-  if (!force && cacheable) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  if (!channel) {
+    return json(
+      {
+        ok: false,
+        error: 'unknown private channel',
+        hint: 'Add the bot as a channel admin and register the webhook; the channel appears after its first post.',
+      },
+      404,
+    );
+  }
+
+  // sign media URLs for webhook photos (bot token never leaves the worker)
+  if (env.BOT_TOKEN) {
+    posts = await Promise.all(
+      posts.map(async (p) =>
+        p.image || !p.file_id
+          ? p
+          : { ...p, image: `${url.origin}/media/${encodeURIComponent(p.file_id)}?sig=${await sign(env, p.file_id)}` },
+      ),
+    );
+  }
+
+  // self link: never contains the key
+  const self = new URL(url.origin + url.pathname);
+  if (route.viaQuery) self.searchParams.set('channel', route.channel);
+  if (route.formatParam) self.searchParams.set('format', route.formatParam);
+  const selfUrl = self.toString();
+
+  const body = format === 'atom' ? renderAtom(channel, posts, selfUrl) : renderRss(channel, posts, selfUrl);
+  const response = new Response(body, {
+    headers: {
+      'content-type': format === 'atom' ? ATOM_CONTENT_TYPE : RSS_CONTENT_TYPE,
+      'cache-control': `public, max-age=${Math.floor(ttlMs / 1000)}`,
+      'x-robots-tag': 'noindex, nofollow',
+    },
+  });
+  if (cacheable) ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
   return response;
 }
 
 /** drop cached feeds for a channel so a new post shows up immediately */
-async function purgeChannelCache(origin, username) {
-  if (!username) return;
-  for (const path of [`/rss/${username}`, `/atom/${username}`]) {
-    await Promise.all([
-      caches.default.delete(new Request(`${origin}${path}?format=rss`, { method: 'GET' })),
-      caches.default.delete(new Request(`${origin}${path}?format=atom`, { method: 'GET' })),
-    ]);
-  }
+async function purgeChannelCache(origin, chat) {
+  const values = [chat.username && String(chat.username).toLowerCase(), publicId(chat.id)].filter(Boolean);
+  await Promise.all(
+    values.flatMap((v) => ['rss', 'atom'].map((f) => caches.default.delete(cacheRequest(origin, f, v)))),
+  );
 }
 
-async function handleWebhook(request, env, ctx, secret, origin) {
+async function handleWebhook(request, env, ctx, origin) {
   const expected = String(env.WEBHOOK_SECRET || '').trim();
-  if (!expected) {
-    return json({ ok: false, error: 'webhook disabled (WEBHOOK_SECRET not set)' }, 503);
-  }
-  if (!secretEquals(secret, expected)) {
-    return json({ ok: false, error: 'bad webhook secret' }, 403);
-  }
+  if (!expected) return json({ ok: false, error: 'webhook disabled (WEBHOOK_SECRET not set)' }, 503);
 
-  const headerSecret = request.headers.get('x-telegram-bot-api-secret-token') || '';
-  if (!secretEquals(headerSecret, expected)) {
-    return json({ ok: false, error: 'bad secret header' }, 403);
-  }
+  const header = request.headers.get('x-telegram-bot-api-secret-token') || '';
+  if (!(await safeEq(header, expected))) return json({ ok: false, error: 'bad secret' }, 403);
 
   let update;
   try {
@@ -861,82 +754,98 @@ async function handleWebhook(request, env, ctx, secret, origin) {
     return json({ ok: false, error: 'invalid json' }, 400);
   }
 
-  const message = update.channel_post || update.edited_channel_post || update.message;
-  if (!message || !message.chat) return json({ ok: true, skipped: true });
+  // channel posts only -- groups the bot happens to sit in are ignored
+  const msg = update.channel_post || update.edited_channel_post;
+  if (!msg?.chat) return json({ ok: true, skipped: true });
 
-  try {
-    await persistWebhookPost(env, message, ctx);
-  } catch (err) {
-    return json({ ok: false, error: String(err) }, 500);
-  }
+  const chat = msg.chat;
+  const key = channelKey(chat.id, chat.username);
+  const post = normalizeTelegramPost(msg);
 
-  await purgeChannelCache(origin, message.chat?.username);
+  await env.DB.batch([
+    channelStmt(
+      env,
+      {
+        key,
+        chat_id: String(chat.id ?? ''),
+        username: chat.username || '',
+        title: chat.title || '',
+        link: channelLink(chat),
+      },
+      { webhookAt: Date.now() },
+    ),
+    postStmt(env, key, post, true),
+  ]);
 
-  return json({ ok: true, message_id: message.message_id });
+  ctx.waitUntil(purgeChannelCache(origin, chat));
+  return json({ ok: true, message_id: msg.message_id });
 }
 
-async function handleBackfill(request, env, ctx, url) {
-  let body = {};
-  try {
-    body = await request.json();
-  } catch {
-    /* empty body is fine */
+async function handleMedia(env, fileId, sig) {
+  if (!env.BOT_TOKEN || !env.API_KEY || !(await safeEq(sig, await sign(env, fileId)))) {
+    return json({ ok: false, error: 'forbidden' }, 403);
   }
-  const channelRaw = body.channel || url.searchParams.get('channel');
-  if (!channelRaw) return json({ ok: false, error: 'missing channel' }, 400);
+  const meta = await fetch(
+    `https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`,
+  ).then((r) => r.json()).catch(() => null);
+  const path = meta?.result?.file_path;
+  if (!path) return json({ ok: false, error: 'file not found' }, 404);
 
-  const ref = normalizeChannelRef(channelRaw);
-  const pages = num(body.pages || url.searchParams.get('pages'), 3);
-  const days = num(body.days || url.searchParams.get('days'), num(env.FEED_DAYS, DEFAULT_FEED_DAYS));
-  const cutoff = Date.now() - days * 86_400_000;
-  const preview = await fetchPreview(ref, pages, cutoff);
-  const stored = await findStoredChannel(env, ref);
+  const upstream = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${path}`);
+  if (!upstream.ok) return json({ ok: false, error: 'upstream error' }, 502);
 
-  const username = preview.meta.username || stored?.username || ref.username;
-  const chatId = stored?.id || (ref.kind === 'numeric' ? ref.chatIds[0] : '');
-  const channel = {
-    id: chatId,
-    key: stored?.key || channelKey(chatId, username),
-    username,
-    title: preview.meta.title || stored?.title || `@${ref.username || ref.value}`,
-    description: preview.meta.description || stored?.description || '',
-    photo: preview.meta.photo || stored?.photo || null,
-    link: stored?.link || ref.link,
-  };
-
-  await persistPosts(env, channel, preview.posts, cutoff);
-  await purgeChannelCache(url.origin, channel.username);
-
-  return json({
-    ok: true,
-    channel: channel.title,
-    key: channel.key,
-    posts: preview.posts.length,
-    days,
-    pages,
+  const type = upstream.headers.get('content-type') || '';
+  return new Response(upstream.body, {
+    headers: {
+      'content-type': type.startsWith('image/') ? type : 'image/jpeg',
+      'cache-control': 'public, max-age=86400, immutable',
+    },
   });
 }
 
-async function handleSetupWebhook(request, env, ctx, url) {
+async function handleSetupWebhook(env, url) {
   if (!env.BOT_TOKEN) return json({ ok: false, error: 'BOT_TOKEN is not configured' }, 400);
   const secret = String(env.WEBHOOK_SECRET || '').trim();
-  if (!secret) return json({ ok: false, error: 'WEBHOOK_SECRET is not configured' }, 400);
+  // Telegram only allows A-Z a-z 0-9 _ - (1..256 chars) in secret_token
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(secret)) {
+    return json({ ok: false, error: 'WEBHOOK_SECRET must match [A-Za-z0-9_-]{1,256}' }, 400);
+  }
 
-  const target = `${url.origin}/hook/${secret}`;
-  const api = `https://api.telegram.org/bot${env.BOT_TOKEN}/setWebhook`;
-  const res = await fetch(api, {
+  const target = `${url.origin}/hook`;
+  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/setWebhook`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       url: target,
       secret_token: secret,
-      allowed_updates: ['channel_post', 'edited_channel_post', 'message'],
+      allowed_updates: ['channel_post', 'edited_channel_post'],
       drop_pending_updates: true,
       max_connections: 10,
     }),
   });
   const payload = await res.json().catch(() => ({}));
   return json({ ok: res.ok && payload?.ok !== false, webhook: target, result: payload });
+}
+
+async function handleFeeds(env) {
+  const { results } = await env.DB.prepare(
+    'SELECT key, title, username, link, updated_at FROM channels ORDER BY updated_at DESC',
+  ).all();
+  return json({ ok: true, count: results.length, channels: results });
+}
+
+function parseFeedRoute(path, url) {
+  const formatParam = url.searchParams.get('format') === 'atom' ? 'atom' : '';
+  let m;
+  if ((m = /^\/(rss|atom)\/(.+)$/.exec(path))) {
+    return { format: formatParam || m[1], channel: safeDecode(m[2]), viaQuery: false, formatParam };
+  }
+  const channel = url.searchParams.get('channel') || url.searchParams.get('username') || '';
+  if (path === '/rss' || path === '/feed.xml') {
+    return { format: formatParam || 'rss', channel, viaQuery: true, formatParam };
+  }
+  if (path === '/atom') return { format: 'atom', channel, viaQuery: true, formatParam: '' };
+  return null;
 }
 
 function helpPage() {
@@ -947,13 +856,15 @@ function helpPage() {
 code,pre{background:#f4f4f5;padding:2px 6px;border-radius:4px}pre{padding:12px;overflow:auto}
 h1{font-size:22px}</style></head><body>
 <h1>Telegram &rarr; RSS</h1>
-<p>This worker converts a Telegram channel into an RSS/Atom feed. Every feed request must carry the predefined key.</p>
-<pre>GET  /rss/&lt;channel&gt;?key=YOUR_KEY     RSS 2.0
-GET  /atom/&lt;channel&gt;?key=YOUR_KEY    Atom 1.0
-GET  /feeds?key=YOUR_KEY            list known channels
-POST /admin/backfill?key=YOUR_KEY   {"channel":"name","pages":3}</pre>
-<p>Channel may be <code>@name</code>, <code>name</code>, <code>t.me/name</code>, <code>c/123456789</code> or the numeric chat id.</p>
-<p>The key can also be sent as the <code>X-API-Key</code> header or <code>Authorization: Bearer &lt;key&gt;</code>.</p>
+<p>Converts a Telegram channel into an RSS/Atom feed. Every feed request must carry the key.</p>
+<pre>GET /rss/&lt;channel&gt;?key=YOUR_KEY
+GET /atom/&lt;channel&gt;?key=YOUR_KEY
+GET /feed.xml?channel=&lt;channel&gt;&amp;key=YOUR_KEY
+GET /feeds?key=YOUR_KEY
+
+options: &amp;limit=50 &amp;days=30 &amp;pages=2 &amp;refresh=1</pre>
+<p>Channel may be <code>@name</code>, <code>name</code>, <code>t.me/name</code>, <code>c/123456789</code> or the numeric chat id.
+The key may also be sent as <code>Authorization: Bearer &lt;key&gt;</code>.</p>
 </body></html>`;
 }
 
@@ -965,74 +876,52 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, '') || '/';
+    const method = request.method;
 
     try {
-      if (path === '/health') {
-        return json({ ok: true, ts: Date.now(), hasBotToken: Boolean(env.BOT_TOKEN) });
-      }
+      if (path === '/health') return json({ ok: true, ts: Date.now() });
 
       if (path === '/' || path === '/index.html') {
         return new Response(helpPage(), {
-          headers: {
-            'content-type': 'text/html; charset=utf-8',
-            'cache-control': 'public, max-age=3600',
-          },
+          headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=3600' },
         });
       }
 
-      if (path.startsWith('/hook/')) {
-        if (request.method !== 'POST') return json({ ok: false, error: 'method not allowed' }, 405);
-        return handleWebhook(
-          request,
-          env,
-          ctx,
-          decodeURIComponent(path.slice('/hook/'.length)),
-          url.origin,
-        );
+      if (path === '/hook') {
+        if (method !== 'POST') return json({ ok: false, error: 'method not allowed' }, 405);
+        return handleWebhook(request, env, ctx, url.origin);
       }
 
-      // Everything below is key protected.
-      if (!isAuthorized(request, url, env)) return unauthorized();
-
-      if (path === '/feeds') {
-        const channels = await listChannels(env);
-        return json({ ok: true, count: channels.length, channels });
+      if (path.startsWith('/media/')) {
+        if (method !== 'GET') return json({ ok: false, error: 'method not allowed' }, 405);
+        return handleMedia(env, safeDecode(path.slice('/media/'.length)), url.searchParams.get('sig') || '');
       }
 
-      if (path === '/admin/backfill') {
-        if (request.method !== 'POST') return json({ ok: false, error: 'method not allowed' }, 405);
-        return handleBackfill(request, env, ctx, url);
-      }
+      // everything below is key protected
+      if (!(await isAuthorized(request, url, env))) return unauthorized();
 
       if (path === '/admin/setup-webhook') {
-        if (request.method !== 'POST') return json({ ok: false, error: 'method not allowed' }, 405);
-        return handleSetupWebhook(request, env, ctx, url);
+        if (method !== 'POST') return json({ ok: false, error: 'method not allowed' }, 405);
+        return handleSetupWebhook(env, url);
       }
 
-      let channelRaw = null;
-      let format = 'rss';
+      if (method !== 'GET' && method !== 'HEAD') return json({ ok: false, error: 'method not allowed' }, 405);
 
-      if (path === '/rss' || path === '/feed.xml' || path === '/rss.xml') {
-        channelRaw = url.searchParams.get('channel') || url.searchParams.get('username');
-      } else if (path.startsWith('/rss/')) {
-        channelRaw = decodeURIComponent(path.slice('/rss/'.length));
-      } else if (path.startsWith('/atom/')) {
-        channelRaw = decodeURIComponent(path.slice('/atom/'.length));
-        format = 'atom';
-      } else if (path === '/atom' || path === '/atom.xml') {
-        channelRaw = url.searchParams.get('channel');
-        format = 'atom';
-      }
+      if (path === '/feeds') return handleFeeds(env);
 
-      if (channelRaw !== null) {
-        if (url.searchParams.get('format') === 'atom') format = 'atom';
-        if (!channelRaw) return json({ ok: false, error: 'missing channel' }, 400);
-        return handleFeed(request, env, ctx, url, channelRaw, format);
+      const route = parseFeedRoute(path, url);
+      if (route) {
+        if (!route.channel) return json({ ok: false, error: 'missing channel' }, 400);
+        return handleFeed(env, ctx, url, route);
       }
 
       return json({ ok: false, error: 'not found' }, 404);
     } catch (err) {
       return json({ ok: false, error: String(err?.stack || err) }, 500);
     }
+  },
+
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(cleanup(env));
   },
 };

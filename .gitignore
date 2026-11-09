@@ -1,6 +1,12 @@
-node_modules/
+.env
+.dev.vars
+
+.DS_Store
+Thumbs.db
+
+wrangler.toml
+*.log
+
 .wrangler/
 dist/
-.dev.vars
-*.log
-.DS_Store
+node_modules/

@@ -1,208 +1,148 @@
 # Telegram → RSS · Cloudflare Worker
 
-Turns any Telegram channel into a standard **RSS 2.0** / **Atom** feed, served from the
-edge and protected by a **predefined key**.
+Turns a Telegram channel into an **RSS 2.0** or **Atom** feed, served from the edge and
+protected by a key. Posts are stored in **Cloudflare D1**; the public preview page is
+parsed with **HTMLRewriter**.
 
-```bash
-https://telegram-rss-worker.<you>.workers.dev/rss/telegram?key=YOUR_KEY
 ```
+https://telegram-rss.<you>.workers.dev/rss/telegram?key=YOUR_KEY
+```
+
+## Contents
+
+[Secrets](#secrets) · [Quick start](#quick-start) · [Access](#access) ·
+[Live updates](#live-updates-and-private-channels) · [Endpoints](#endpoints) ·
+[Configuration](#configuration) · [Retention](#retention) · [Storage](#storage) ·
+[Local dev](#local-development) · [Notes](#notes) · [Migrating](#migrating-from-the-kv-version)
 
 ---
 
-## Getting the three values you need
+## Secrets
 
-Only three values are required. **Two you invent yourself, one comes from Telegram.**
+| Secret | Required | Source | Unlocks |
+| --- | --- | --- | --- |
+| `API_KEY` | yes | you generate it | access to every feed; also signs media URLs |
+| `WEBHOOK_SECRET` | for the webhook | you generate it | authenticating Telegram's webhook calls |
+| `BOT_TOKEN` | for the webhook | [@BotFather](https://t.me/BotFather) | real-time updates, private channels, photos |
 
-| Value | Where it comes from | What it unlocks |
-| --- | --- | --- |
-| `API_KEY` | **You generate it** | Access to the feed — always required |
-| `WEBHOOK_SECRET` | **You generate it** | Authenticating the Telegram webhook |
-| `BOT_TOKEN` | **@BotFather**, on Telegram | Real-time updates, private channels, inline images |
-
-### `API_KEY`: the predefined feed key
-
-Telegram never issues this one — you choose it. It is the password every reader must
-present to open your feed, so generate a long random value rather than something
-guessable:
+`API_KEY` alone is enough to serve **public** channels from the preview page.
 
 ```bash
-openssl rand -hex 32
+openssl rand -hex 32   # API_KEY
+openssl rand -hex 24   # WEBHOOK_SECRET — only [A-Za-z0-9_-], max 256 chars (Telegram's rule)
 ```
 
-The output is 64 hex characters, e.g. `4f9c1e0b7a2d8c6e3f5a…`. Store it as a Worker secret:
+**Bot token:** in Telegram open @BotFather → `/newbot` → pick a display name and a
+username ending in `bot` → copy the token (`7123456789:AAH…`, including the part before
+the colon).
 
-```bash
-npx wrangler secret put API_KEY
-```
-
-Wrangler prompts for the value — paste it and press Enter (the input is not echoed).
-The **same string** then goes into your feed URL:
-
-```
-https://telegram-rss-worker.<you>.workers.dev/rss/telegram?key=4f9c1e0b7a2d8c6e3f5a…
-```
-
-### `WEBHOOK_SECRET`: the webhook shared secret
-
-Also self-generated. It is embedded in the webhook URL path **and** must equal the
-`X-Telegram-Bot-Api-Secret-Token` header that Telegram sends, so the worker can reject
-calls that did not come from Telegram.
-
-Telegram only accepts `A-Z a-z 0-9 _ -` here (max 256 characters), so stick to hex or
-underscores:
-
-```bash
-openssl rand -hex 24
-```
-
-```bash
-npx wrangler secret put WEBHOOK_SECRET
-```
-
-**Keep this value** — you need it again for the `setWebhook` call in
-[Enabling live updates](#enabling-live-updates-recommended).
-
-### `BOT_TOKEN`: from @BotFather
-
-1. Open Telegram and search for [@BotFather](https://t.me/BotFather) — confirm the blue
-   verification check — then press **Start**.
-2. Send the command `/newbot`.
-3. BotFather asks for a **display name** → any label, e.g. `My RSS Feed`.
-4. BotFather asks for a **username** → it must end in `bot`, e.g. `myrssfeedbot`.
-5. BotFather replies with the token:
-
-   ```
-   Use this token to access the HTTP API:
-   7123456789:AAHfqk3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-   ```
-
-   That whole string is the token — copy it including the part before the colon.
-
-```bash
-npx wrangler secret put BOT_TOKEN
-```
-
-> Treat the bot token like a password: it grants full control of your bot. Keep it out of
-> git and out of `wrangler.toml` — Worker secrets are encrypted at rest.
-
-### Checking what you have
-
-```bash
-npx wrangler secret list
-```
-
-This prints the **names only**, never the values:
-
-```
-┌─────────────────┬─────────┐
-│ name            │ type    │
-├─────────────────┼─────────┤
-│ API_KEY         │ secret  │
-│ BOT_TOKEN       │ secret  │
-│ WEBHOOK_SECRET  │ secret  │
-└─────────────────┴─────────┘
-```
-
-### Do I need all three?
-
-No. **`API_KEY` alone is enough** to publish feeds for public channels — posts are pulled
-from the public preview. Add `BOT_TOKEN` and `WEBHOOK_SECRET` when you want real-time
-updates, access to private channels, or inline images.
-
----
-
-## Why this works without a bot
-
-The worker pulls posts from two sources and merges them:
-
-| Source | When it is used | Requirements |
-| --- | --- | --- |
-| **Public preview** — `https://t.me/s/<channel>` | Always available as a fallback; used to backfill history | Channel must be public |
-| **Bot webhook** — Telegram Bot API `setWebhook` | Gives real-time updates for channels you own (including private ones) | Bot must be an admin of the channel |
-
-So a feed works for *any* public channel immediately after deployment, and gets instant
-updates once the bot is added to the channel.
+Store each one with `./deploy.sh secret put <NAME>`. Check the names with
+`./deploy.sh secret list` (values are never shown). Keep the bot token out of git and out
+of the wrangler config.
 
 ---
 
 ## Quick start
 
-**1. Install and create the KV namespace**
-
 ```bash
-npm install
-npx wrangler kv namespace create CHANNEL_KV
+# 1. create the database and copy the printed database_id
+npx wrangler d1 create telegram-rss
+
+# 2. keep the id local (gitignored)
+echo 'D1_DATABASE_ID=<paste id>' > .env
+
+# 3. create the tables
+chmod +x deploy.sh
+./deploy.sh d1 execute telegram-rss --remote --file=schema.sql
+
+# 4. secrets (see above)
+./deploy.sh secret put API_KEY
+./deploy.sh secret put WEBHOOK_SECRET   # optional
+./deploy.sh secret put BOT_TOKEN        # optional
+
+# 5. deploy
+./deploy.sh deploy
 ```
 
-Copy the printed `id` / `preview_id` into `wrangler.toml`.
+`<channel>` in a feed URL can be `@name`, `name`, `t.me/name`, `t.me/c/123456789`, or a
+numeric chat id (`-1001234567890`).
 
-**2. Set your secrets**
+### Keeping `database_id` out of git
 
-See [Getting the three values](#getting-the-three-values-you-need) for exactly what each
-value is, where it comes from, and how to generate it.
+Wrangler reads one config file and does not expand environment variables, so the repo
+renders it:
 
-```bash
-npx wrangler secret put API_KEY          # the predefined feed key  → required
-npx wrangler secret put WEBHOOK_SECRET   # webhook path + header secret → required for live updates
-npx wrangler secret put BOT_TOKEN        # token from @BotFather → optional
-```
+| File | In git | Purpose |
+| --- | --- | --- |
+| `wrangler.template.toml` | yes | real config, with `database_id = "${D1_DATABASE_ID}"` |
+| `.env` | no | `D1_DATABASE_ID=…` |
+| `wrangler.toml` | no | generated from the template on every `./deploy.sh` run |
+| `deploy.sh` | yes | runs `envsubst`, then forwards all arguments to `wrangler` |
 
-**3. Deploy**
+Always call wrangler through `./deploy.sh` (`deploy`, `dev`, `d1 …`, `secret …`).
+`envsubst` comes with `gettext`. In CI, export `D1_DATABASE_ID` from a secret and run
+`envsubst '${D1_DATABASE_ID}' < wrangler.template.toml > wrangler.toml`.
 
-```bash
-npm run deploy
-```
-
-The feed is now live:
-
-```
-https://telegram-rss-worker.<you>.workers.dev/rss/<channel>?key=YOUR_API_KEY
-```
-
-`<channel>` accepts `@name`, `name`, `t.me/name`, `t.me/c/123456789` or the raw numeric
-chat id (`-1001234567890`).
+> A D1 `database_id` is not a credential; it is useless without your API token. With
+> wrangler ≥ 4.45 (open beta) you can also omit it and let `wrangler deploy` provision
+> the database.
 
 ---
 
-## Access protection
+## Access
 
-Every feed route requires the predefined key (`API_KEY`). Comparison is constant-time.
+Every feed route needs `API_KEY`, compared through SHA-256 digests with
+`timingSafeEqual`.
 
 | Method | Example |
 | --- | --- |
-| Query parameter | `GET /rss/telegram?key=YOUR_KEY` |
-| Header | `GET /rss/telegram` + `X-API-Key: YOUR_KEY` |
-| Bearer token | `GET /rss/telegram` + `Authorization: Bearer YOUR_KEY` |
+| Query parameter | `?key=…` (`?token=` and `?access_token=` also work) |
+| Bearer header | `Authorization: Bearer …` |
 
-Responses without a valid key return `401` and never contain channel content.
-
-The Telegram webhook is protected separately by `WEBHOOK_SECRET`, which must appear
-**both** in the URL path and in Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
+Requests without a valid key get `401` and no channel content. The feed's own `self` link
+never contains the key. Query-string keys can end up in logs, so prefer the header if
+your reader supports it.
 
 ---
 
-## Enabling live updates (recommended)
+## Live updates and private channels
 
-1. Create a bot with [@BotFather](https://t.me/BotFather) → copy the token.
-2. Add the bot to your channel as an **administrator** (the "post messages" permission is
-   enough for `channel_post` updates).
-3. Register the webhook — either automatically:
+Without a bot the worker only sees public channels. With a bot you get instant updates,
+**private channels**, and photos.
+
+1. Add the bot to the channel as an **administrator** (permission to post messages is
+   enough).
+2. Register the webhook:
 
    ```bash
-   curl -X POST "https://telegram-rss-worker.<you>.workers.dev/admin/setup-webhook?key=YOUR_KEY"
+   curl -X POST "https://telegram-rss.<you>.workers.dev/admin/setup-webhook?key=YOUR_KEY"
    ```
 
-   or manually:
+   Manual equivalent:
 
    ```bash
    curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
-     -d url="https://telegram-rss-worker.<you>.workers.dev/hook/<WEBHOOK_SECRET>" \
-     -d secret_token="<WEBHOOK_SECRET>"
+     -d url="https://telegram-rss.<you>.workers.dev/hook" \
+     -d secret_token="<WEBHOOK_SECRET>" \
+     -d 'allowed_updates=["channel_post","edited_channel_post"]'
    ```
 
-New posts are written to KV and the cached feed is purged, so readers see them
-immediately. Image attachments are resolved through the Bot API (`getFile`) and embedded
-as `media:content` / `enclosure`.
+Telegram then calls `POST /hook` with `WEBHOOK_SECRET` in the
+`X-Telegram-Bot-Api-Secret-Token` header. New posts are written to D1 and the cached feed
+is purged. Only channel posts are stored; groups the bot sits in are ignored.
+
+**Private channels** have no public preview, so they exist only through the webhook:
+
+- A private channel appears after the bot receives its **first post**; until then its
+  feed URL returns `404`.
+- Request it by numeric id (`-1001234567890`, `1234567890` or `t.me/c/1234567890`).
+- The worker never scrapes private channels.
+
+**Media.** Preview posts use the image URL from `t.me`. Webhook photos are served through
+`/media/<file_id>?sig=<hmac>`; the signature is an HMAC of the file id keyed with
+`API_KEY`, so the bot token never appears in a feed. Rotating `API_KEY` invalidates issued
+media URLs until readers refetch the feed. Only photos are proxied (no video, documents
+or stickers).
 
 ---
 
@@ -210,107 +150,105 @@ as `media:content` / `enclosure`.
 
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
-| `GET` | `/` | – | Help page |
-| `GET` | `/health` | – | Health probe |
-| `GET` | `/rss/:channel` | key | RSS 2.0 feed |
-| `GET` | `/atom/:channel` | key | Atom 1.0 feed |
-| `GET` | `/feed.xml?channel=…` | key | RSS alias |
-| `GET` | `/feeds` | key | List of harvested channels |
-| `POST` | `/admin/backfill` | key | `{"channel":"name","pages":3}` — scrape history |
-| `POST` | `/admin/setup-webhook` | key | Register the Telegram webhook |
-| `POST` | `/hook/:secret` | secret | Telegram webhook sink |
+| `GET` | `/` · `/health` | – | help page · health probe |
+| `GET` | `/rss/:channel` · `/atom/:channel` | key | RSS / Atom feed |
+| `GET` | `/rss?channel=…` · `/feed.xml?channel=…` · `/atom?channel=…` | key | same, channel as a query parameter |
+| `GET` | `/feeds` | key | known channels |
+| `GET` | `/media/:fileId?sig=…` | signature | photo proxy for webhook posts |
+| `POST` | `/admin/setup-webhook` | key | register the Telegram webhook |
+| `POST` | `/hook` | secret header | Telegram webhook sink |
 
-Feed query parameters: `limit` (default 50), `pages` (default 2 preview pages),
-`days` (default 30 — retention window), `refresh=1` (bypass the cache), `format=atom`.
+| Feed parameter | Default | Meaning |
+| --- | --- | --- |
+| `limit` | `50` (max `500`) | items in the feed |
+| `days` | `FEED_DAYS` | only posts newer than N days |
+| `pages` | `2` (max `10`) | preview pages scraped on a refresh |
+| `refresh=1` | – | force a scrape and bypass the cache; with `pages=N` it is a manual backfill |
+| `format=atom` | – | Atom instead of RSS |
+| `channel` / `username` | – | channel for the query-style routes |
 
 ---
 
 ## Configuration
 
-`wrangler.toml` `[vars]` — changeable without redeploying secrets:
+`[vars]` in `wrangler.template.toml`:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `API_KEY` | – | **The predefined key** guarding all feed routes — [how to get](#api_key-the-predefined-feed-key) |
-| `WEBHOOK_SECRET` | – | Secret for the webhook path and header — [how to get](#webhook_secret-the-webhook-shared-secret) |
-| `BOT_TOKEN` | – | Telegram bot token — [how to get](#bot_token-from-botfather) |
-| `FEED_DAYS` | `30` | **Retention window** — the feed only exposes the last N days |
-| `MAX_POSTS` | `1000` | Posts kept per channel in KV (history cap) |
-| `CACHE_TTL` | `300` | Edge cache lifetime in seconds |
-| `POST_TTL_DAYS` | `30` | How long a stored post expires in KV |
-| `RESOLVE_MEDIA` | `1` | Set to `0` to skip Bot API media lookups |
+| `FEED_DAYS` | `30` | retention window |
+| `MAX_POSTS` | `5000` | posts kept per channel, enforced by the nightly cleanup |
+| `CACHE_TTL` | `300` | edge cache lifetime and minimum time between scrapes (seconds) |
 
 ---
 
-## Retention window (last 30 days)
+## Retention
 
-By default a feed only exposes posts from the **last 30 days**. The window is applied at
-four points, so old content never leaks through:
+A feed exposes only the last `FEED_DAYS` (30) days. The window is applied at four points:
 
-1. **At render time** — items older than the cutoff are dropped from the feed, even if
-   they are still present in KV (KV expiry is lazy, so this is the real guarantee).
-2. **During backfill** — pagination stops as soon as a page is entirely older than the
-   window, so history is not fetched needlessly.
-3. **During persistence** — posts older than the window are never written to KV.
-4. **In storage** — `POST_TTL_DAYS` (30) expires the remaining records.
+1. **Render:** the query returns only posts newer than the cutoff.
+2. **Backfill:** pagination stops at the first page that is entirely older.
+3. **Write:** preview posts older than the window are never stored.
+4. **Storage:** a daily cron (`17 3 * * *` UTC) deletes posts older than `FEED_DAYS` and
+   trims each channel to its newest `MAX_POSTS`.
 
-Adjust it globally with `FEED_DAYS`, or per request with `?days=N`:
+`?days=N` narrows the window per request. A value above `FEED_DAYS` only returns what is
+still stored, so raise `FEED_DAYS` instead. Custom `days` or `limit` values bypass the
+edge cache.
 
-```
-/rss/telegram?key=YOUR_KEY          # last 30 days (FEED_DAYS)
-/rss/telegram?key=YOUR_KEY&days=7   # last 7 days
-/rss/telegram?key=YOUR_KEY&days=90  # last 90 days
-```
-
-> **Heads-up:** the window is strict, so a channel that posts less often than every 30
-> days will return an **empty feed**. Raise `FEED_DAYS` for quiet channels — for example
-> `FEED_DAYS=365` for a monthly newsletter. `MAX_POSTS` must stay comfortably above
-> `posts_per_day × FEED_DAYS`, or the window gets truncated by the history cap.
-
-Feeds with a custom `?days=` value bypass the edge cache, so a cached feed never
-contradicts the window you asked for.
+> The window is strict: a channel that posts less often than every 30 days returns an
+> **empty feed**. Raise `FEED_DAYS` for quiet channels (for example `365`), and keep
+> `MAX_POSTS` above `posts_per_day × FEED_DAYS`.
 
 ---
 
-## How storage works
+## Storage
 
-* **Key** — the channel's public username (`mychannel`), so a channel is never
-  duplicated. Channels without a username fall back to `id:<chatId>`.
-* `chan:<key>` — channel metadata (title, description, logo, last update).
-* `idx:<key>` — ordered list of message ids.
-* `post:<key>:<messageId>` — one post per key, including rendered formatting entities.
-* `alias:i:<chatId>` — maps a numeric chat id onto the username key.
+Tables are defined in [`schema.sql`](schema.sql).
 
-Feeds are cached in the Cloudflare cache for `CACHE_TTL` seconds and purged as soon as a
-webhook delivers a new post.
+- **`channels`** — one row per channel, keyed by lowercase username, or `id:<publicId>`
+  when there is none. Holds title, description, logo, `chat_id`, and the `fetched_at` /
+  `webhook_at` timestamps.
+- **`posts`** — primary key `(chan, id)`: text, HTML, link, date, image URL or photo
+  `file_id`, and `source` (`webhook` or `preview`). A webhook post is never overwritten
+  by a later scrape of the same message.
+
+**Refresh logic.** A feed request scrapes `t.me/s/<channel>` when forced, when the
+channel has no posts, or when the last scrape is older than `CACHE_TTL`, unless a webhook
+delivered something within the last hour. Writes go through D1 `batch()`.
+
+**Preview parsing.** HTMLRewriter rebuilds each message body from a tag whitelist
+(`a b i u s code pre br blockquote …`) with all attributes dropped, except an `http(s)`
+`href` on links.
 
 ---
 
-## Local testing
-
-The test suite runs offline with a mocked KV binding, cache and network:
+## Local development
 
 ```bash
-npm test
-```
-
-For an interactive local server:
-
-```bash
-npx wrangler dev
+echo 'API_KEY=change-me' > .dev.vars        # gitignored
+./deploy.sh d1 execute telegram-rss --local --file=schema.sql
+./deploy.sh dev
 curl "http://localhost:8787/rss/telegram?key=change-me"
 ```
 
 ---
 
-## Notes & limits
+## Notes
 
-* The public preview exposes roughly the **last 20 posts per page**; `?pages=N` or
-  `/admin/backfill` walks further back with `?before=<id>`.
-* **Private channels** only work through the bot webhook — the public preview is
-  unavailable to them.
-* KV on the free plan allows 1,000 writes/day. For high-traffic channels prefer a paid
-  KV namespace, or `RESOLVE_MEDIA=0` to reduce writes.
-* Media URLs resolved via the Bot API are valid for ~1 hour; the worker refreshes them
-  in the background.
-* Feeds are marked `noindex, nofollow` so they are not picked up by search engines.
+- The public preview shows about 20 posts per page; `?refresh=1&pages=N` walks further
+  back.
+- Overlapping formatting in webhook posts (for example bold plus italic on the same text)
+  is not nested; the first entity wins.
+- `lastBuildDate` is the newest post's date, and `<language>` is omitted.
+- Feeds are sent with `noindex, nofollow`.
+
+---
+
+## Migrating from the KV version
+
+- The KV namespace is unused and nothing is migrated. Channels are re-scraped on the
+  first request; webhook history older than the preview window is lost.
+- Removed: `POST /admin/backfill` (use `?refresh=1&pages=N`), the `/hook/:secret` path
+  secret (the header check stays), the `X-API-Key` and `X-Feed-Key` headers, `/rss.xml`,
+  `/atom.xml`, and the `POST_TTL_DAYS` and `RESOLVE_MEDIA` variables.
+- Run `/admin/setup-webhook` again so Telegram points at the new `/hook` URL.

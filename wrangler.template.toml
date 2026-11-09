@@ -1,0 +1,23 @@
+# Committed template. `deploy.sh` renders it to wrangler.toml (gitignored),
+# filling in D1_DATABASE_ID from your local .env. Edit THIS file, not wrangler.toml.
+name = "telegram-rss"
+main = "worker.js"
+compatibility_date = "2025-06-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "telegram-rss"
+database_id = "${D1_DATABASE_ID}"
+
+[triggers]
+crons = ["17 3 * * *"]   # daily cleanup of old posts
+
+[vars]
+CACHE_TTL = "300"
+FEED_DAYS = "30"
+MAX_POSTS = "5000"
+
+# secrets (./deploy.sh secret put <NAME>):
+#   API_KEY          required, feed key
+#   WEBHOOK_SECRET   optional, [A-Za-z0-9_-]{1,256}
+#   BOT_TOKEN        optional, only for webhook + media
