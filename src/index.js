@@ -1,12 +1,12 @@
 /**
- * Telegram Channel -> RSS · Cloudflare Worker (D1 + HTMLRewriter)
+ * Telegram Channel -> RSS / Atom · Cloudflare Worker (D1 + HTMLRewriter)
  * ----------------------------------------------------------------
  * Ingestion (auto-fallback):
  *   1. Bot API webhook (POST /hook) -> D1  (bot must be admin of the channel)
  *   2. Public preview t.me/s/<name> -> D1  (backfill + channels without bot access)
  *
- * Auth: feed routes require env.API_KEY via ?key= (also ?token= / ?access_token=)
- *       or "Authorization: Bearer <key>". The webhook is guarded by Telegram's
+ * Auth: feed routes require env.API_KEY, sent as ?key=<key> or
+ *       "Authorization: Bearer <key>". The webhook is guarded by Telegram's
  *       X-Telegram-Bot-Api-Secret-Token header (= env.WEBHOOK_SECRET).
  *       Media URLs embedded in feeds are HMAC-signed, so the bot token never leaks.
  *
@@ -15,13 +15,11 @@
  *   GET  /health                    liveness probe
  *   GET  /rss/:channel              RSS 2.0                        (?key=)
  *   GET  /atom/:channel             Atom 1.0                       (?key=)
- *   GET  /rss | /feed.xml | /atom?channel=<name>                   (?key=)
- *   GET  /feeds                     known channels                 (?key=)
  *   GET  /media/:fileId?sig=        HMAC-signed media proxy
  *   POST /admin/setup-webhook       register the Telegram webhook  (?key=)
  *   POST /hook                      Telegram webhook sink (secret-token guarded)
  *
- * Feed params: ?limit= ?days= ?pages= ?refresh=1 ?format=atom
+ * Feed params: ?limit= ?days= ?pages= ?refresh=1
  *   (?refresh=1&pages=N doubles as a backfill)
  *
  * Env bindings: DB (D1) · API_KEY · BOT_TOKEN? · WEBHOOK_SECRET? ·
@@ -36,8 +34,6 @@ const DEFAULT_PAGES = 3; // preview pages per scrape
 const MAX_PAGES = 10; // cap for ?pages=
 const MAX_LIMIT = 5000; // cap for ?limit=, also its default
 const WEBHOOK_FRESH_MS = 3_600_000; // skip rescraping channels the webhook keeps fresh
-const RSS_CONTENT_TYPE = "application/rss+xml; charset=utf-8";
-const ATOM_CONTENT_TYPE = "application/atom+xml; charset=utf-8";
 const textEncoder = new TextEncoder();
 
 /* ------------------------------------------------------------------ */
@@ -55,6 +51,9 @@ function json(data, status = 200, extraHeaders = {}) {
     },
   });
 }
+
+const methodNotAllowed = () =>
+  json({ ok: false, error: "method not allowed" }, 405);
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -156,22 +155,18 @@ async function createSigner(env) {
 /* authorization                                                        */
 /* ------------------------------------------------------------------ */
 
+/** accepts the key as "Authorization: Bearer <key>" or as ?key=<key> */
 async function isAuthorized(request, url, env) {
   const expected = String(env.API_KEY || "").trim();
   if (!expected) return false;
 
-  const auth = request.headers.get("authorization") || "";
-  const bearer = /^bearer\s+/i.test(auth)
-    ? auth.replace(/^bearer\s+/i, "").trim()
-    : "";
-  const candidates = [
-    bearer,
-    url.searchParams.get("key"),
-    url.searchParams.get("token"),
-    url.searchParams.get("access_token"),
-  ].filter(Boolean);
+  const bearer = /^bearer\s+(.+)$/i
+    .exec(request.headers.get("authorization") || "")?.[1]
+    ?.trim();
 
-  for (const k of candidates) if (await safeEq(k, expected)) return true;
+  for (const candidate of [bearer, url.searchParams.get("key")]) {
+    if (await safeEq(candidate, expected)) return true;
+  }
   return false;
 }
 
@@ -770,9 +765,24 @@ export function renderAtom(channel, posts, selfUrl) {
   return parts.join("\n");
 }
 
+/** one entry per supported URL format: /rss/:channel and /atom/:channel */
+const FEED_FORMATS = {
+  rss: { render: renderRss, contentType: "application/rss+xml; charset=utf-8" },
+  atom: {
+    render: renderAtom,
+    contentType: "application/atom+xml; charset=utf-8",
+  },
+};
+
 /* ------------------------------------------------------------------ */
-/* routes                                                               */
+/* feed handler                                                         */
 /* ------------------------------------------------------------------ */
+
+/** "/rss/<channel>" or "/atom/<channel>" -> { format, channel }, otherwise null */
+export function parseFeedRoute(path) {
+  const match = /^\/(rss|atom)\/(.+)$/.exec(path);
+  return match ? { format: match[1], channel: safeDecode(match[2]) } : null;
+}
 
 const cacheRequest = (origin, format, value) =>
   new Request(`${origin}/__cache/${format}/${encodeURIComponent(value)}`);
@@ -791,12 +801,12 @@ function getFeedOptions(request, url, env) {
   const forceRefresh = url.searchParams.get("refresh") === "1";
 
   return {
-    days,
     limit,
     pages,
     forceRefresh,
     cutoff: Date.now() - days * DAY_MS,
     ttlMs: positiveNumber(env.CACHE_TTL, DEFAULT_CACHE_TTL) * 1000,
+    // only the default GET feed is cached; HEAD and customised requests bypass it
     cacheable:
       request.method === "GET" &&
       !forceRefresh &&
@@ -810,6 +820,7 @@ function shouldFetchPreview({ forceRefresh, posts, channel, ref, now, ttlMs }) {
     channel?.webhook_at != null && now - channel.webhook_at < WEBHOOK_FRESH_MS;
   const previewIsStale =
     channel?.fetched_at == null || now - channel.fetched_at > ttlMs;
+  // private channels (numeric id, no username) are available only via the webhook
   const isPrivate = ref.kind === "numeric" && !channel?.username;
 
   return (
@@ -818,52 +829,12 @@ function shouldFetchPreview({ forceRefresh, posts, channel, ref, now, ttlMs }) {
   );
 }
 
-async function signPostMedia(posts, origin, env) {
-  if (!env.BOT_TOKEN) return posts;
-
-  const sign = await createSigner(env);
-  return Promise.all(
-    posts.map(async (post) => {
-      if (post.image || !post.file_id) return post;
-
-      const fileId = encodeURIComponent(post.file_id);
-      const signature = await sign(post.file_id);
-      return {
-        ...post,
-        image: `${origin}/media/${fileId}?sig=${signature}`,
-      };
-    }),
-  );
-}
-
-function buildSelfUrl(url, route) {
-  const self = new URL(url.origin + url.pathname);
-  if (route.viaQuery) self.searchParams.set("channel", route.channel);
-  if (route.formatParam) self.searchParams.set("format", route.formatParam);
-  return self.toString();
-}
-
-async function handleFeed(request, env, ctx, route) {
-  const url = new URL(request.url);
-  const ref = normalizeChannelRef(route.channel);
-  if (!ref.value) return json({ ok: false, error: "missing channel" }, 400);
-  const format = route.format;
-
-  const options = getFeedOptions(request, url, env);
-  const { cutoff, limit, pages, forceRefresh, ttlMs, cacheable } = options;
-  const cacheKey = cacheRequest(url.origin, format, ref.value);
-
-  // Cache only the default GET feed; HEAD and customized requests bypass it.
-  if (cacheable) {
-    const hit = await caches.default.match(cacheKey);
-    if (hit) return hit;
-  }
-
+/** reads channel + posts from D1, topping up from the public preview when stale */
+async function loadFeed(env, ref, options) {
+  const { cutoff, limit, pages, forceRefresh, ttlMs } = options;
   let channel = await findChannel(env, ref);
   let posts = channel ? await getPosts(env, channel.key, cutoff, limit) : [];
 
-  // A fresh webhook takes precedence over preview scraping. Private channels
-  // are available only through the webhook.
   if (
     shouldFetchPreview({
       forceRefresh,
@@ -883,53 +854,26 @@ async function handleFeed(request, env, ctx, route) {
       channel = buildChannel(preview, channel, ref);
       await persistPreview(env, channel, preview.posts);
       posts = await getPosts(env, channel.key, cutoff, limit);
-    } else if (!channel) {
-      return json(
-        { ok: false, error: "channel not found or has no public preview" },
-        404,
-      );
     }
   }
 
-  if (!channel) {
-    return json(
-      {
-        ok: false,
-        error: "unknown private channel",
-        hint: "Add the bot as a channel admin and register the webhook; the channel appears after its first post.",
-      },
-      404,
-    );
-  }
+  return { channel, posts };
+}
 
-  // a forced refresh also drops the cached default variant
-  if (forceRefresh) {
-    ctx.waitUntil(
-      purgeChannelCache(url.origin, {
-        username: channel.username,
-        chatId: channel.chat_id,
-      }),
-    );
-  }
+/** posts without a preview image get a signed /media URL, so the bot token never leaks */
+async function signPostMedia(posts, origin, env) {
+  if (!env.BOT_TOKEN) return posts;
 
-  // Signed proxy URLs keep the bot token out of feed responses.
-  posts = await signPostMedia(posts, url.origin, env);
+  const sign = await createSigner(env);
+  return Promise.all(
+    posts.map(async (post) => {
+      if (post.image || !post.file_id) return post;
 
-  const selfUrl = buildSelfUrl(url, route);
-  const body =
-    format === "atom"
-      ? renderAtom(channel, posts, selfUrl)
-      : renderRss(channel, posts, selfUrl);
-  const contentType = format === "atom" ? ATOM_CONTENT_TYPE : RSS_CONTENT_TYPE;
-  const response = new Response(body, {
-    headers: {
-      "content-type": contentType,
-      "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`,
-      "x-robots-tag": "noindex, nofollow",
-    },
-  });
-  if (cacheable) ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
-  return response;
+      const fileId = encodeURIComponent(post.file_id);
+      const signature = await sign(post.file_id);
+      return { ...post, image: `${origin}/media/${fileId}?sig=${signature}` };
+    }),
+  );
 }
 
 /** drop cached feeds for a channel so a new post shows up immediately */
@@ -940,12 +884,70 @@ async function purgeChannelCache(origin, { username = "", chatId = "" }) {
   ].filter(Boolean);
   await Promise.all(
     values.flatMap((value) =>
-      ["rss", "atom"].map((format) =>
+      Object.keys(FEED_FORMATS).map((format) =>
         caches.default.delete(cacheRequest(origin, format, value)),
       ),
     ),
   );
 }
+
+async function handleFeed(request, env, ctx, { format, channel: rawChannel }) {
+  const url = new URL(request.url);
+  const ref = normalizeChannelRef(rawChannel);
+  if (!ref.value) return json({ ok: false, error: "missing channel" }, 400);
+
+  const options = getFeedOptions(request, url, env);
+  const cacheKey = cacheRequest(url.origin, format, ref.value);
+
+  if (options.cacheable) {
+    const hit = await caches.default.match(cacheKey);
+    if (hit) return hit;
+  }
+
+  const { channel, posts } = await loadFeed(env, ref, options);
+  if (!channel) {
+    return json(
+      {
+        ok: false,
+        error: "channel not found",
+        hint: "Public channels need a t.me/s preview. Private channels need the bot as channel admin plus the registered webhook, and appear after their first post.",
+      },
+      404,
+    );
+  }
+
+  // a forced refresh also drops the cached default variant
+  if (options.forceRefresh) {
+    ctx.waitUntil(
+      purgeChannelCache(url.origin, {
+        username: channel.username,
+        chatId: channel.chat_id,
+      }),
+    );
+  }
+
+  const { render, contentType } = FEED_FORMATS[format];
+  const selfUrl = url.origin + url.pathname;
+  const body = render(
+    channel,
+    await signPostMedia(posts, url.origin, env),
+    selfUrl,
+  );
+  const response = new Response(body, {
+    headers: {
+      "content-type": contentType,
+      "cache-control": `public, max-age=${Math.floor(options.ttlMs / 1000)}`,
+      "x-robots-tag": "noindex, nofollow",
+    },
+  });
+  if (options.cacheable)
+    ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
+  return response;
+}
+
+/* ------------------------------------------------------------------ */
+/* other routes                                                         */
+/* ------------------------------------------------------------------ */
 
 async function handleWebhook(request, env, ctx, origin) {
   const expected = String(env.WEBHOOK_SECRET || "").trim();
@@ -1056,151 +1058,93 @@ async function handleSetupWebhook(env, url) {
   });
 }
 
-async function handleFeeds(env) {
-  const { results } = await env.DB.prepare(
-    "SELECT key, title, username, link, updated_at FROM channels ORDER BY updated_at DESC",
-  ).all();
-  return json({ ok: true, count: results.length, channels: results });
-}
+const HELP_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Telegram &rarr; RSS Worker</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body { font: 15px/1.6 system-ui, -apple-system, sans-serif; max-width: 720px; margin: 48px auto; padding: 0 20px; color: #222; }
+  code, pre { background: #f4f4f5; padding: 2px 6px; border-radius: 4px; }
+  pre { padding: 12px; overflow: auto; }
+  h1 { font-size: 22px; }
+</style>
+</head>
+<body>
+<h1>Telegram &rarr; RSS</h1>
+<p>Converts a Telegram channel into an RSS or Atom feed. Every feed request must carry the key.</p>
+<pre>GET /rss/&lt;channel&gt;?key=YOUR_KEY
+GET /atom/&lt;channel&gt;?key=YOUR_KEY
 
-export function parseFeedRoute(path, url) {
-  const formatParam = url.searchParams.get("format") === "atom" ? "atom" : "";
-  const channel =
-    url.searchParams.get("channel") || url.searchParams.get("username") || "";
-  const route = (format, value, viaQuery, queryFormat = formatParam) => ({
-    format,
-    channel: value,
-    viaQuery,
-    formatParam: queryFormat,
-  });
-
-  const match = /^\/(rss|atom)\/(.+)$/.exec(path);
-  if (match) return route(formatParam || match[1], safeDecode(match[2]), false);
-  if (path === "/rss" || path === "/feed.xml") {
-    return route(formatParam || "rss", channel, true);
-  }
-  if (path === "/atom") return route("atom", channel, true, "");
-  return null;
-}
-
-function helpPage() {
-  return `
-  <!doctype html>
-  <html lang="en">
-    <head>
-      <meta charset="utf-8" />
-      <title>Telegram &rarr; RSS Worker</title>
-      <meta name="viewport" content="width=device-width,initial-scale=1" />
-      <style>
-        body {
-          font:
-            15px/1.6 system-ui,
-            -apple-system,
-            sans-serif;
-          max-width: 720px;
-          margin: 48px auto;
-          padding: 0 20px;
-          color: #222;
-        }
-        code,
-        pre {
-          background: #f4f4f5;
-          padding: 2px 6px;
-          border-radius: 4px;
-        }
-        pre {
-          padding: 12px;
-          overflow: auto;
-        }
-        h1 {
-          font-size: 22px;
-        }
-      </style>
-    </head>
-    <body>
-      <h1>Telegram &rarr; RSS</h1>
-      <p>
-        Converts a Telegram channel into an RSS/Atom feed. Every feed request must
-        carry the key.
-      </p>
-      <pre>
-  GET /rss/&lt;channel&gt;?key=YOUR_KEY
-  GET /atom/&lt;channel&gt;?key=YOUR_KEY
-  GET /feed.xml?channel=&lt;channel&gt;&amp;key=YOUR_KEY
-  GET /feeds?key=YOUR_KEY
-
-  options: &amp;limit=${DEFAULT_MAX_POSTS} &amp;days=${DEFAULT_FEED_DAYS} &amp;pages=${DEFAULT_PAGES} &amp;refresh=1</pre>
-      <p>
-        Channel may be <code>@name</code>, <code>name</code>,
-        <code>t.me/name</code>, <code>c/123456789</code> or the numeric chat id. <br/>
-        The key may also be sent as
-        <code>Authorization: Bearer &lt;key&gt;</code>.
-      </p>
-    </body>
-  </html>
-`;
-}
+options: &amp;limit=${MAX_LIMIT} &amp;days=${DEFAULT_FEED_DAYS} &amp;pages=${DEFAULT_PAGES} &amp;refresh=1</pre>
+<p>
+  Channel may be <code>@name</code>, <code>name</code>, <code>t.me/name</code>,
+  <code>c/123456789</code> or the numeric chat id.<br>
+  The key may also be sent as <code>Authorization: Bearer &lt;key&gt;</code>.
+</p>
+</body>
+</html>`;
 
 /* ------------------------------------------------------------------ */
 /* entrypoint                                                           */
 /* ------------------------------------------------------------------ */
 
-const methodNotAllowed = () =>
-  json({ ok: false, error: "method not allowed" }, 405);
+/** public routes first, then everything behind the API key */
+async function route(request, env, ctx) {
+  const url = new URL(request.url);
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+  const { method } = request;
+
+  // public routes
+  if (path === "/health") return json({ ok: true, ts: Date.now() });
+
+  if (path === "/") {
+    return new Response(HELP_HTML, {
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "public, max-age=3600",
+      },
+    });
+  }
+
+  if (path === "/hook") {
+    if (method !== "POST") return methodNotAllowed();
+    return handleWebhook(request, env, ctx, url.origin);
+  }
+
+  if (path.startsWith("/media/")) {
+    if (method !== "GET") return methodNotAllowed();
+    return handleMedia(
+      env,
+      safeDecode(path.slice("/media/".length)),
+      url.searchParams.get("sig") || "",
+    );
+  }
+
+  // everything below is key protected
+  if (!(await isAuthorized(request, url, env))) return unauthorized();
+
+  if (path === "/admin/setup-webhook") {
+    if (method !== "POST") return methodNotAllowed();
+    return handleSetupWebhook(env, url);
+  }
+
+  const feed = parseFeedRoute(path);
+  if (feed) {
+    if (method !== "GET" && method !== "HEAD") return methodNotAllowed();
+    return handleFeed(request, env, ctx, feed);
+  }
+
+  return json({ ok: false, error: "not found" }, 404);
+}
 
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname.replace(/\/+$/, "") || "/";
-    const method = request.method;
-
     try {
-      // public routes
-      if (path === "/health") return json({ ok: true, ts: Date.now() });
-
-      if (path === "/" || path === "/index.html") {
-        return new Response(helpPage(), {
-          headers: {
-            "content-type": "text/html; charset=utf-8",
-            "cache-control": "public, max-age=3600",
-          },
-        });
-      }
-
-      if (path === "/hook") {
-        if (method !== "POST") return methodNotAllowed();
-        return handleWebhook(request, env, ctx, url.origin);
-      }
-
-      if (path.startsWith("/media/")) {
-        if (method !== "GET") return methodNotAllowed();
-        return handleMedia(
-          env,
-          safeDecode(path.slice("/media/".length)),
-          url.searchParams.get("sig") || "",
-        );
-      }
-
-      // everything below is key protected
-      if (!(await isAuthorized(request, url, env))) return unauthorized();
-
-      if (path === "/admin/setup-webhook") {
-        if (method !== "POST") return methodNotAllowed();
-        return handleSetupWebhook(env, url);
-      }
-
-      if (method !== "GET" && method !== "HEAD") return methodNotAllowed();
-
-      if (path === "/feeds") return handleFeeds(env);
-
-      const route = parseFeedRoute(path, url);
-      if (route) {
-        if (!route.channel)
-          return json({ ok: false, error: "missing channel" }, 400);
-        return handleFeed(request, env, ctx, route);
-      }
-
-      return json({ ok: false, error: "not found" }, 404);
+      // `await` is required: a bare `return route(...)` would let a rejected
+      // handler promise skip this catch and surface as an unhandled Worker error
+      return await route(request, env, ctx);
     } catch (err) {
       return json({ ok: false, error: String(err?.stack || err) }, 500);
     }
