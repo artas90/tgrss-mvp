@@ -7,7 +7,7 @@ compatibility_date = "2025-06-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "telegram-rss"
-database_id = "${D1_DATABASE_ID}"
+database_id = "__D1_DATABASE_ID__"
 
 [triggers]
 crons = ["17 3 * * *"]   # daily cleanup of old posts

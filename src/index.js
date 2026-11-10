@@ -15,6 +15,7 @@
  *   GET  /health                    liveness probe
  *   GET  /rss/:channel              RSS 2.0                        (?key=)
  *   GET  /atom/:channel             Atom 1.0                       (?key=)
+ *   GET  /feeds                     known channels (JSON)          (?key=)
  *   GET  /media/:fileId?sig=        HMAC-signed media proxy
  *   POST /admin/setup-webhook       register the Telegram webhook  (?key=)
  *   POST /hook                      Telegram webhook sink (secret-token guarded)
@@ -26,14 +27,14 @@
  *               FEED_DAYS? (30) · MAX_POSTS? (5000) · CACHE_TTL? (300 s)
  */
 
-const DAY_MS = 86_400_000;
-const DEFAULT_FEED_DAYS = 30; // feed window and post retention (FEED_DAYS)
-const DEFAULT_MAX_POSTS = 5000; // per-channel cap, enforced by cron (MAX_POSTS)
-const DEFAULT_CACHE_TTL = 300; // seconds: preview rescrape interval + feed cache (CACHE_TTL)
-const DEFAULT_PAGES = 3; // preview pages per scrape
-const MAX_PAGES = 10; // cap for ?pages=
-const MAX_LIMIT = 5000; // cap for ?limit=, also its default
-const WEBHOOK_FRESH_MS = 3_600_000; // skip rescraping channels the webhook keeps fresh
+const MS_PER_DAY = 86_400_000;
+const DEFAULT_FEED_WINDOW_DAYS = 30; // feed window and post retention (FEED_DAYS)
+const DEFAULT_MAX_STORED_POSTS = 5000; // per-channel cap, enforced by cron (MAX_POSTS)
+const DEFAULT_CACHE_TTL_SECONDS = 300; // seconds: preview rescrape interval + feed cache (CACHE_TTL)
+const DEFAULT_PREVIEW_PAGES = 3; // preview pages per scrape
+const MAX_PREVIEW_PAGES = 10; // cap for ?pages=
+const MAX_POSTS_PER_FEED = 5000; // cap for ?limit=, also its default
+const WEBHOOK_FRESH_WINDOW_MS = 3_600_000; // skip rescraping channels the webhook keeps fresh
 const textEncoder = new TextEncoder();
 
 /* ------------------------------------------------------------------ */
@@ -333,9 +334,9 @@ async function persistPreview(env, channel, posts) {
 
 /** cron: drop posts outside the retention window and above the per-channel cap */
 async function cleanup(env) {
-  const days = positiveNumber(env.FEED_DAYS, DEFAULT_FEED_DAYS);
-  const cutoffIso = new Date(Date.now() - days * DAY_MS).toISOString();
-  const max = positiveNumber(env.MAX_POSTS, DEFAULT_MAX_POSTS);
+  const days = positiveNumber(env.FEED_DAYS, DEFAULT_FEED_WINDOW_DAYS);
+  const cutoffIso = new Date(Date.now() - days * MS_PER_DAY).toISOString();
+  const max = positiveNumber(env.MAX_POSTS, DEFAULT_MAX_STORED_POSTS);
   await env.DB.batch([
     env.DB.prepare("DELETE FROM posts WHERE date < ?1").bind(cutoffIso),
     env.DB.prepare(
@@ -788,15 +789,15 @@ const cacheRequest = (origin, format, value) =>
   new Request(`${origin}/__cache/${format}/${encodeURIComponent(value)}`);
 
 function getFeedOptions(request, url, env) {
-  const defaultDays = positiveNumber(env.FEED_DAYS, DEFAULT_FEED_DAYS);
+  const defaultDays = positiveNumber(env.FEED_DAYS, DEFAULT_FEED_WINDOW_DAYS);
   const days = positiveNumber(url.searchParams.get("days"), defaultDays);
   const limit = Math.min(
-    positiveNumber(url.searchParams.get("limit"), MAX_LIMIT),
-    MAX_LIMIT,
+    positiveNumber(url.searchParams.get("limit"), MAX_POSTS_PER_FEED),
+    MAX_POSTS_PER_FEED,
   );
   const pages = Math.min(
-    positiveNumber(url.searchParams.get("pages"), DEFAULT_PAGES),
-    MAX_PAGES,
+    positiveNumber(url.searchParams.get("pages"), DEFAULT_PREVIEW_PAGES),
+    MAX_PREVIEW_PAGES,
   );
   const forceRefresh = url.searchParams.get("refresh") === "1";
 
@@ -804,20 +805,21 @@ function getFeedOptions(request, url, env) {
     limit,
     pages,
     forceRefresh,
-    cutoff: Date.now() - days * DAY_MS,
-    ttlMs: positiveNumber(env.CACHE_TTL, DEFAULT_CACHE_TTL) * 1000,
+    cutoff: Date.now() - days * MS_PER_DAY,
+    ttlMs: positiveNumber(env.CACHE_TTL, DEFAULT_CACHE_TTL_SECONDS) * 1000,
     // only the default GET feed is cached; HEAD and customised requests bypass it
     cacheable:
       request.method === "GET" &&
       !forceRefresh &&
       days === defaultDays &&
-      limit === MAX_LIMIT,
+      limit === MAX_POSTS_PER_FEED,
   };
 }
 
 function shouldFetchPreview({ forceRefresh, posts, channel, ref, now, ttlMs }) {
   const webhookIsFresh =
-    channel?.webhook_at != null && now - channel.webhook_at < WEBHOOK_FRESH_MS;
+    channel?.webhook_at != null &&
+    now - channel.webhook_at < WEBHOOK_FRESH_WINDOW_MS;
   const previewIsStale =
     channel?.fetched_at == null || now - channel.fetched_at > ttlMs;
   // private channels (numeric id, no username) are available only via the webhook
@@ -1058,6 +1060,14 @@ async function handleSetupWebhook(env, url) {
   });
 }
 
+/** every channel the worker knows about (webhook-fed or scraped), newest first */
+async function handleFeeds(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT key, title, username, link, updated_at FROM channels ORDER BY updated_at DESC",
+  ).all();
+  return json({ ok: true, count: results.length, channels: results });
+}
+
 const HELP_HTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -1069,19 +1079,72 @@ const HELP_HTML = `<!doctype html>
   code, pre { background: #f4f4f5; padding: 2px 6px; border-radius: 4px; }
   pre { padding: 12px; overflow: auto; }
   h1 { font-size: 22px; }
+  h2 { font-size: 17px; margin-top: 32px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #e4e4e7; vertical-align: top; }
+  th { font-weight: 600; }
 </style>
 </head>
 <body>
 <h1>Telegram &rarr; RSS</h1>
-<p>Converts a Telegram channel into an RSS or Atom feed. Every feed request must carry the key.</p>
-<pre>GET /rss/&lt;channel&gt;?key=YOUR_KEY
-GET /atom/&lt;channel&gt;?key=YOUR_KEY
+<p>Converts a Telegram channel into an RSS or Atom feed.</p>
 
-options: &amp;limit=${MAX_LIMIT} &amp;days=${DEFAULT_FEED_DAYS} &amp;pages=${DEFAULT_PAGES} &amp;refresh=1</pre>
+<h2>Endpoints</h2>
+<table>
+<tr><th>Method</th><th>Path</th><th>Auth</th><th>Description</th></tr>
+<tr><td>GET</td><td><code>/</code></td><td>none</td><td>This page</td></tr>
+<tr><td>GET</td><td><code>/health</code></td><td>none</td><td>Liveness probe</td></tr>
+<tr><td>GET</td><td><code>/rss/&lt;channel&gt;</code></td><td>API key</td><td>RSS 2.0 feed</td></tr>
+<tr><td>GET</td><td><code>/atom/&lt;channel&gt;</code></td><td>API key</td><td>Atom 1.0 feed</td></tr>
+<tr><td>GET</td><td><code>/feeds</code></td><td>API key</td><td>JSON list of the channels the worker knows about</td></tr>
+<tr><td>GET</td><td><code>/media/&lt;fileId&gt;?sig=&hellip;</code></td><td>signature</td><td>Signed media proxy; the URLs are generated inside feeds</td></tr>
+<tr><td>POST</td><td><code>/admin/setup-webhook</code></td><td>API key</td><td>Register the Telegram webhook</td></tr>
+<tr><td>POST</td><td><code>/hook</code></td><td>Telegram secret header</td><td>Telegram webhook sink (called by Telegram)</td></tr>
+</table>
+
+<h2>Authentication</h2>
 <p>
-  Channel may be <code>@name</code>, <code>name</code>, <code>t.me/name</code>,
-  <code>c/123456789</code> or the numeric chat id.<br>
-  The key may also be sent as <code>Authorization: Bearer &lt;key&gt;</code>.
+  Endpoints marked <em>API key</em> take the key as <code>?key=YOUR_KEY</code>
+  or as <code>Authorization: Bearer YOUR_KEY</code>.
+  A key containing <code>=</code>, <code>&amp;</code>, <code>+</code> or <code>%</code>
+  must be percent-encoded in the query string; the header needs no encoding.
+</p>
+<pre>curl "https://HOST/rss/&lt;channel&gt;?key=YOUR_KEY"
+curl -H "Authorization: Bearer YOUR_KEY" "https://HOST/atom/&lt;channel&gt;"</pre>
+
+<h2>Channel</h2>
+<p>
+  <code>&lt;channel&gt;</code> may be <code>@name</code>, <code>name</code>,
+  <code>t.me/name</code>, <code>c/123456789</code> or the numeric chat id.
+</p>
+
+<h2>Feed options</h2>
+<table>
+<tr><th>Param</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>limit</code></td><td>${MAX_POSTS_PER_FEED}</td><td>Max posts in the feed (also the upper bound)</td></tr>
+<tr><td><code>days</code></td><td>${DEFAULT_FEED_WINDOW_DAYS}</td><td>How many days back the feed reaches</td></tr>
+<tr><td><code>pages</code></td><td>${DEFAULT_PREVIEW_PAGES}</td><td>Preview pages to scrape per refresh (max ${MAX_PREVIEW_PAGES})</td></tr>
+<tr><td><code>refresh=1</code></td><td>off</td><td>Skip the cache and rescrape now; with <code>pages=N</code> it doubles as a backfill</td></tr>
+</table>
+
+<h2>Backfill</h2>
+<p>
+  A normal request scrapes only the newest ${DEFAULT_PREVIEW_PAGES} preview pages.
+  To load older history, force a refresh and ask for more pages (max ${MAX_PREVIEW_PAGES}).
+  Scraping stops early once it reaches posts older than <code>days</code>.
+  This works for public channels; private channels fill up through the webhook.
+</p>
+<pre># scrape up to ${MAX_PREVIEW_PAGES} preview pages, discard the XML, print the HTTP status
+curl -s -o /dev/null -w "%{http_code}" "https://HOST/rss/&lt;channel&gt;?key=YOUR_KEY&amp;refresh=1&amp;pages=${MAX_PREVIEW_PAGES}"
+
+# reach further back (also needs FEED_DAYS &gt;= 90, see below)
+curl -s -o /dev/null -w "%{http_code}" "https://HOST/rss/&lt;channel&gt;?key=YOUR_KEY&amp;refresh=1&amp;pages=${MAX_PREVIEW_PAGES}&amp;days=90"
+
+# check that the channel is now stored
+curl "https://HOST/feeds?key=YOUR_KEY"</pre>
+<p>
+  Posts older than <code>FEED_DAYS</code> (default ${DEFAULT_FEED_WINDOW_DAYS} days) are removed by the cleanup cron,
+  so raise that setting if you want a longer history to stay.
 </p>
 </body>
 </html>`;
@@ -1130,9 +1193,16 @@ async function route(request, env, ctx) {
     return handleSetupWebhook(env, url);
   }
 
+  const isRead = method === "GET" || method === "HEAD";
+
+  if (path === "/feeds") {
+    if (!isRead) return methodNotAllowed();
+    return handleFeeds(env);
+  }
+
   const feed = parseFeedRoute(path);
   if (feed) {
-    if (method !== "GET" && method !== "HEAD") return methodNotAllowed();
+    if (!isRead) return methodNotAllowed();
     return handleFeed(request, env, ctx, feed);
   }
 

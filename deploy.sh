@@ -24,9 +24,19 @@ if [[ -z "${D1_DATABASE_ID:-}" ]]; then
   exit 1
 fi
 
-command -v envsubst >/dev/null || { echo "error: envsubst missing (install gettext)" >&2; exit 1; }
+# the id is pasted into a sed expression, so allow only characters a D1 id can contain
+if [[ ! "$D1_DATABASE_ID" =~ ^[A-Za-z0-9-]+$ ]]; then
+  echo "error: D1_DATABASE_ID in .env has unexpected characters (expected letters, digits, dashes)" >&2
+  exit 1
+fi
 
-# only this one variable is substituted; any other $ in the template is left alone
-envsubst '${D1_DATABASE_ID}' < wrangler.template.toml > wrangler.toml
+placeholder="__D1_DATABASE_ID__"
+if ! grep -qF "$placeholder" wrangler.template.toml; then
+  echo "error: wrangler.template.toml has no $placeholder placeholder (use: database_id = \"$placeholder\")" >&2
+  exit 1
+fi
+
+# replace the placeholder; everything else in the template is copied unchanged
+sed "s|$placeholder|$D1_DATABASE_ID|g" wrangler.template.toml > wrangler.toml
 
 exec npx wrangler "$@"
