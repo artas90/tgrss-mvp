@@ -12,15 +12,30 @@ https://telegram-rss.<account>.workers.dev/rss/telegram?key=YOUR_KEY
 ## Quick start
 
 ```bash
-npx wrangler d1 create telegram-rss                              # 1. note the printed database_id
-echo 'D1_DATABASE_ID=<paste id>' > .env                          # 2. keep it local (gitignored)
+# 1. create the database and note the printed database_id
+npx wrangler d1 create telegram-rss
+
+# 2. keep the id local (gitignored)
+echo 'D1_DATABASE_ID=<paste id>' > .env
 chmod +x deploy.sh
-./deploy.sh d1 execute telegram-rss --remote --file=schema.sql   # 3. create the tables
-./deploy.sh secret put API_KEY                                   # 4. secrets, see below
-./deploy.sh secret put WEBHOOK_SECRET                            #    optional
-./deploy.sh secret put BOT_TOKEN                                 #    optional
-./deploy.sh deploy                                               # 5. deploy
+
+# 3. create the tables (including the per-channel feed tokens)
+./deploy.sh d1 execute telegram-rss --remote --file=schema.sql
+
+# 4. secrets, see below (WEBHOOK_SECRET and BOT_TOKEN are optional)
+./deploy.sh secret put API_KEY
+./deploy.sh secret put WEBHOOK_SECRET
+./deploy.sh secret put BOT_TOKEN
+
+# 5. deploy
+./deploy.sh deploy
 ```
+
+**Upgrading an existing database** (created before feed tokens): run
+`./deploy.sh d1 execute telegram-rss --remote --file=migrate_feed_token.sql` once **before**
+you deploy this version. It adds `channels.feed_token`, gives every existing channel a random
+token and adds a unique index; the worker fails on a database without that column. A new
+database needs only `schema.sql`.
 
 Always run wrangler through `./deploy.sh`. It renders the git-ignored `wrangler.toml` from
 `wrangler.template.toml` and `.env` by replacing the `__D1_DATABASE_ID__` placeholder
@@ -45,10 +60,21 @@ the wrangler config. `./deploy.sh secret list` shows the names, never the values
 (`telegram-rss` is `name` in `wrangler.template.toml`, `<account>` is your workers.dev
 subdomain). Below, `HOST` stands for that address and `KEY` for your `API_KEY`.
 
+**Give feed readers the channel token URL, not the key.** Each channel has its own token,
+which opens only that channel's feed. A channel is listed once it has been fetched (open
+`HOST/rss/<channel>?key=KEY` once) or, for a private channel, once the bot has received its
+first post. List every channel with its token and both URL forms:
+
+```bash
+curl "HOST/feeds?key=KEY"
+```
+
 | Goal | URL |
 | --- | --- |
-| RSS | `HOST/rss/telegram?key=KEY` |
-| Atom | `HOST/atom/telegram?key=KEY` |
+| RSS, token (for readers) | `HOST/rss/<token>` |
+| Atom, token (for readers) | `HOST/atom/<token>` |
+| RSS, by name | `HOST/rss/telegram?key=KEY` |
+| Atom, by name | `HOST/atom/telegram?key=KEY` |
 | Last 7 days, 20 items | `HOST/rss/telegram?key=KEY&days=7&limit=20` |
 | Private channel (needs the bot) | `HOST/rss/-1001234567890?key=KEY` |
 | Key in a header | `curl -H "Authorization: Bearer KEY" HOST/rss/telegram` |
@@ -64,10 +90,13 @@ subdomain). Below, `HOST` stands for that address and `KEY` for your `API_KEY`.
 | --- | --- | --- | --- |
 | `GET` | `/` · `/health` | – | help page · health probe |
 | `GET` | `/rss/:channel` · `/atom/:channel` | key | RSS / Atom feed |
-| `GET` | `/feeds` | key | JSON list of known channels |
+| `GET` | `/rss/:token` · `/atom/:token` | channel token | the same feed for one channel, no key needed |
+| `GET` | `/feeds` | key | JSON list of known channels with their tokens and both URL forms |
 | `GET` | `/media/:fileId?sig=…` | signature | photo proxy for webhook posts |
 | `POST` | `/admin/setup-webhook` | key | register the Telegram webhook |
 | `POST` | `/hook` | secret header | Telegram webhook sink |
+
+Feed parameters need the API key; token URLs ignore them and serve the default feed.
 
 | Feed parameter | Default | Meaning |
 | --- | --- | --- |
@@ -77,15 +106,33 @@ subdomain). Below, `HOST` stands for that address and `KEY` for your `API_KEY`.
 | `refresh=1` | – | force a scrape and bypass the cache; with `pages=N` it is a manual backfill |
 
 Removed: query-style routes (`/rss?channel=`, `/feed.xml`, `/atom?channel=`), `?format=atom`,
-and the `?token=` / `?access_token=` key parameters.
+and the `?token=` / `?access_token=` aliases for the API key (a channel token goes in the
+path, not in a query parameter).
 
 ## Access
 
-Feed routes, `/feeds` and `/admin/setup-webhook` need `API_KEY`, sent as `?key=…` or as
-`Authorization: Bearer …` (compared in constant time). Without a valid key you get `401` and
-no channel content. The feed's own `self` link never contains the key. Query-string keys can
-end up in logs, so prefer the header if your reader supports it. A key containing `=`, `&`,
-`+` or `%` must be percent-encoded in a URL; the header needs no encoding.
+`API_KEY`, sent as `?key=…` or as `Authorization: Bearer …` (compared in constant time),
+unlocks everything: feeds by channel name, `/feeds`, `/admin/setup-webhook` and the feed
+parameters. A key containing `=`, `&`, `+` or `%` must be percent-encoded in a URL; the
+header needs no encoding. Without a valid key you get `401` and no channel content.
+
+**Channel tokens** are the only thing that works without the key, and only for
+`/rss/<token>` and `/atom/<token>`. A token is a random 128-bit value (32 hex characters)
+stored in `channels.feed_token`. D1 creates it when the channel is first stored and it never
+changes by itself. It opens that one channel's default feed, and the feed's `self` link
+carries the token, never the key. A token is a bearer secret like the key, only narrower:
+anyone who has the URL can read that feed, and query-string secrets can end up in logs.
+
+**Regenerating a token** takes one SQL statement (drop the `WHERE` to regenerate all).
+`key` is the lowercase username, or `id:<number>` for a private channel:
+
+```bash
+./deploy.sh d1 execute telegram-rss --remote \
+  --command "UPDATE channels SET feed_token = lower(hex(randomblob(16))) WHERE key = 'telegram'"
+```
+
+The old URL keeps working until its cached copy expires (at most `CACHE_TTL`, 5 minutes by
+default). Then take the new URL from `/feeds`. Rotating `API_KEY` does not change tokens.
 
 ---
 
@@ -161,7 +208,9 @@ the webhook.
   posts, or when the last scrape is older than `CACHE_TTL`, unless the webhook delivered
   something within the last hour. A webhook post is never overwritten by a later scrape.
 - **Storage.** [`schema.sql`](schema.sql) defines `channels` (one row per channel, keyed by
-  lowercase username or `id:<publicId>`) and `posts` (primary key `(chan, id)`).
+  lowercase username or `id:<publicId>`, with its random `feed_token`) and `posts` (primary
+  key `(chan, id)`). [`migrate_feed_token.sql`](migrate_feed_token.sql) upgrades databases
+  that predate `feed_token`.
 - **Parsing.** Message HTML is rebuilt from a tag whitelist with all attributes dropped,
   except an `http(s)` `href` on links. Overlapping formatting in webhook posts is not
   nested; the first entity wins.
@@ -183,7 +232,9 @@ curl "http://localhost:8787/rss/telegram?key=change-me"
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Reader shows the "Telegram → RSS" help text | it fetched `/`, so the URL has no route | subscribe to the full URL: `HOST/rss/<channel>?key=…` |
-| `401` JSON | missing or wrong key | check `?key=` or the Bearer header against `API_KEY`; encode special characters |
+| `401` JSON | missing or wrong key, or a token that was regenerated | check `?key=` or the Bearer header against `API_KEY` (encode special characters); for a token URL take the current one from `/feeds` |
+| `500` with `no such column: feed_token` | the migration has not been run | `./deploy.sh d1 execute telegram-rss --remote --file=migrate_feed_token.sql` |
+| A channel is missing from `/feeds` | it has not been fetched yet | open `HOST/rss/<channel>?key=KEY` once (private channel: wait for the bot's first post) |
 | `404` "channel not found" | wrong name, no public preview, or a private channel the bot has not seen yet | check the username; for private channels add the bot as admin, register the webhook and wait for a post |
 | Feed has a title but no items | no posts within `FEED_DAYS` | raise `FEED_DAYS`, or try `&days=365` |
 | Photos missing on webhook posts | `BOT_TOKEN` not set, or the media is not a photo | set the secret; only photos are proxied |

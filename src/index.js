@@ -5,17 +5,22 @@
  *   1. Bot API webhook (POST /hook) -> D1  (bot must be admin of the channel)
  *   2. Public preview t.me/s/<name> -> D1  (backfill + channels without bot access)
  *
- * Auth: feed routes require env.API_KEY, sent as ?key=<key> or
- *       "Authorization: Bearer <key>". The webhook is guarded by Telegram's
- *       X-Telegram-Bot-Api-Secret-Token header (= env.WEBHOOK_SECRET).
- *       Media URLs embedded in feeds are HMAC-signed, so the bot token never leaks.
+ * Auth: env.API_KEY, sent as ?key=<key> or "Authorization: Bearer <key>", unlocks
+ *       everything. A feed can instead be opened with its random channel token
+ *       (/rss/<token>, stored in channels.feed_token): it reaches only that channel's
+ *       default feed, so readers never see API_KEY. /feeds lists the tokens. The webhook
+ *       is guarded by Telegram's X-Telegram-Bot-Api-Secret-Token header
+ *       (= env.WEBHOOK_SECRET). Media URLs embedded in feeds are HMAC-signed, so the
+ *       bot token never leaks.
  *
  * Routes
  *   GET  /                          help page
  *   GET  /health                    liveness probe
  *   GET  /rss/:channel              RSS 2.0                        (?key=)
  *   GET  /atom/:channel             Atom 1.0                       (?key=)
- *   GET  /feeds                     known channels (JSON)          (?key=)
+ *   GET  /rss/:token                RSS 2.0, one channel           (token only)
+ *   GET  /atom/:token               Atom 1.0, one channel          (token only)
+ *   GET  /feeds                     known channels + tokens (JSON) (?key=)
  *   GET  /media/:fileId?sig=        HMAC-signed media proxy
  *   POST /admin/setup-webhook       register the Telegram webhook  (?key=)
  *   POST /hook                      Telegram webhook sink (secret-token guarded)
@@ -184,6 +189,38 @@ function unauthorized() {
 }
 
 /* ------------------------------------------------------------------ */
+/* per-channel feed tokens                                              */
+/* ------------------------------------------------------------------ */
+
+const FEED_TOKEN_PATTERN = /^[0-9a-f]{32}$/;
+
+/*
+ * A feed token is a random 128-bit value stored in channels.feed_token. D1 generates it
+ * when the channel row is created (see upsertChannelStmt); migrate_feed_token.sql adds the
+ * column and fills existing rows. It opens only that channel's default feed and does not
+ * depend on API_KEY.
+ */
+
+/** the channel row (key, username, chat_id) that owns this token, or null; indexed lookup */
+function findChannelByToken(env, token) {
+  return env.DB.prepare(
+    "SELECT key, username, chat_id FROM channels WHERE feed_token = ?1",
+  )
+    .bind(token)
+    .first();
+}
+
+/** the channel's token, or "" while its row does not exist */
+async function getFeedToken(env, channelKey) {
+  const row = await env.DB.prepare(
+    "SELECT feed_token FROM channels WHERE key = ?1",
+  )
+    .bind(channelKey)
+    .first();
+  return row?.feed_token || "";
+}
+
+/* ------------------------------------------------------------------ */
 /* channel references                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -244,8 +281,9 @@ function upsertChannelStmt(
   { fetchedAt = null, webhookAt = null } = {},
 ) {
   return env.DB.prepare(
-    `INSERT INTO channels (key, chat_id, username, title, description, photo, link, fetched_at, webhook_at, updated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+    // feed_token is set only on insert (random, by D1) and never touched on conflict
+    `INSERT INTO channels (key, chat_id, username, title, description, photo, link, fetched_at, webhook_at, updated_at, feed_token)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, lower(hex(randomblob(16))))
      ON CONFLICT(key) DO UPDATE SET
        chat_id     = COALESCE(NULLIF(excluded.chat_id, ''),     channels.chat_id),
        username    = COALESCE(NULLIF(excluded.username, ''),    channels.username),
@@ -788,18 +826,20 @@ export function parseFeedRoute(path) {
 const cacheRequest = (origin, format, value) =>
   new Request(`${origin}/__cache/${format}/${encodeURIComponent(value)}`);
 
-function getFeedOptions(request, url, env) {
+/** query options are honoured only for API_KEY requests; token holders get the plain default feed */
+function getFeedOptions(request, url, env, isAdmin) {
+  const param = (name) => (isAdmin ? url.searchParams.get(name) : null);
   const defaultDays = positiveNumber(env.FEED_DAYS, DEFAULT_FEED_WINDOW_DAYS);
-  const days = positiveNumber(url.searchParams.get("days"), defaultDays);
+  const days = positiveNumber(param("days"), defaultDays);
   const limit = Math.min(
-    positiveNumber(url.searchParams.get("limit"), MAX_POSTS_PER_FEED),
+    positiveNumber(param("limit"), MAX_POSTS_PER_FEED),
     MAX_POSTS_PER_FEED,
   );
   const pages = Math.min(
-    positiveNumber(url.searchParams.get("pages"), DEFAULT_PREVIEW_PAGES),
+    positiveNumber(param("pages"), DEFAULT_PREVIEW_PAGES),
     MAX_PREVIEW_PAGES,
   );
-  const forceRefresh = url.searchParams.get("refresh") === "1";
+  const forceRefresh = param("refresh") === "1";
 
   return {
     limit,
@@ -879,10 +919,14 @@ async function signPostMedia(posts, origin, env) {
 }
 
 /** drop cached feeds for a channel so a new post shows up immediately */
-async function purgeChannelCache(origin, { username = "", chatId = "" }) {
+async function purgeChannelCache(
+  origin,
+  { username = "", chatId = "", token = "" },
+) {
   const values = [
     String(username || "").toLowerCase(),
     publicId(chatId),
+    token && `token:${token}`,
   ].filter(Boolean);
   await Promise.all(
     values.flatMap((value) =>
@@ -893,16 +937,45 @@ async function purgeChannelCache(origin, { username = "", chatId = "" }) {
   );
 }
 
-async function handleFeed(request, env, ctx, { format, channel: rawChannel }) {
+/**
+ * Serves /rss|atom/<segment>. The segment is either a channel (needs API_KEY) or a
+ * channel token (no key needed, opens only that channel's default feed).
+ */
+async function handleFeed(
+  request,
+  env,
+  ctx,
+  { format, channel: segment },
+  isAdmin,
+) {
   const url = new URL(request.url);
-  const ref = normalizeChannelRef(rawChannel);
+  const options = getFeedOptions(request, url, env, isAdmin);
+  const cached = (key) =>
+    options.cacheable ? caches.default.match(key) : undefined;
+
+  // cache entries under a token key exist only for tokens that were already validated
+  const token = FEED_TOKEN_PATTERN.test(segment) ? segment : "";
+  const tokenCacheKey = cacheRequest(url.origin, format, `token:${token}`);
+  if (token) {
+    const hit = await cached(tokenCacheKey);
+    if (hit) return hit;
+  }
+
+  const tokenChannel = token ? await findChannelByToken(env, token) : null;
+  if (!tokenChannel && !isAdmin) return unauthorized();
+
+  const ref = normalizeChannelRef(
+    tokenChannel
+      ? tokenChannel.username || tokenChannel.chat_id || tokenChannel.key
+      : segment,
+  );
   if (!ref.value) return json({ ok: false, error: "missing channel" }, 400);
 
-  const options = getFeedOptions(request, url, env);
-  const cacheKey = cacheRequest(url.origin, format, ref.value);
-
-  if (options.cacheable) {
-    const hit = await caches.default.match(cacheKey);
+  const cacheKey = tokenChannel
+    ? tokenCacheKey
+    : cacheRequest(url.origin, format, ref.value);
+  if (!tokenChannel) {
+    const hit = await cached(cacheKey);
     if (hit) return hit;
   }
 
@@ -918,12 +991,13 @@ async function handleFeed(request, env, ctx, { format, channel: rawChannel }) {
     );
   }
 
-  // a forced refresh also drops the cached default variant
+  // a forced refresh also drops the cached default variants (by name and by token)
   if (options.forceRefresh) {
     ctx.waitUntil(
       purgeChannelCache(url.origin, {
         username: channel.username,
         chatId: channel.chat_id,
+        token: await getFeedToken(env, channel.key),
       }),
     );
   }
@@ -989,7 +1063,11 @@ async function handleWebhook(request, env, ctx, origin) {
     upsertPostStmt(env, key, normalizeTelegramPost(msg), true),
   ]);
   ctx.waitUntil(
-    purgeChannelCache(origin, { username: chat.username, chatId: chat.id }),
+    purgeChannelCache(origin, {
+      username: chat.username,
+      chatId: chat.id,
+      token: await getFeedToken(env, key),
+    }),
   );
   return json({ ok: true, message_id: msg.message_id });
 }
@@ -1060,12 +1138,31 @@ async function handleSetupWebhook(env, url) {
   });
 }
 
-/** every channel the worker knows about (webhook-fed or scraped), newest first */
-async function handleFeeds(env) {
+/** every known channel, newest first, with its token and both URL forms (token / name + key) */
+async function handleFeeds(env, origin) {
   const { results } = await env.DB.prepare(
-    "SELECT key, title, username, link, updated_at FROM channels ORDER BY updated_at DESC",
+    "SELECT key, title, username, chat_id, link, feed_token, updated_at FROM channels ORDER BY updated_at DESC",
   ).all();
-  return json({ ok: true, count: results.length, channels: results });
+
+  const channels = results.map((channel) => {
+    const token = channel.feed_token;
+    const name = encodeURIComponent(channel.username || channel.chat_id);
+    const urls = (format) => ({
+      by_token: `${origin}/${format}/${token}`,
+      by_name: `${origin}/${format}/${name}?key=YOUR_KEY`,
+    });
+    return {
+      key: channel.key,
+      title: channel.title,
+      username: channel.username,
+      link: channel.link,
+      updated_at: channel.updated_at,
+      token,
+      rss: urls("rss"),
+      atom: urls("atom"),
+    };
+  });
+  return json({ ok: true, count: channels.length, channels });
 }
 
 const HELP_HTML = `<!doctype html>
@@ -1096,7 +1193,8 @@ const HELP_HTML = `<!doctype html>
 <tr><td>GET</td><td><code>/health</code></td><td>none</td><td>Liveness probe</td></tr>
 <tr><td>GET</td><td><code>/rss/&lt;channel&gt;</code></td><td>API key</td><td>RSS 2.0 feed</td></tr>
 <tr><td>GET</td><td><code>/atom/&lt;channel&gt;</code></td><td>API key</td><td>Atom 1.0 feed</td></tr>
-<tr><td>GET</td><td><code>/feeds</code></td><td>API key</td><td>JSON list of the channels the worker knows about</td></tr>
+<tr><td>GET</td><td><code>/rss/&lt;token&gt;</code><br><code>/atom/&lt;token&gt;</code></td><td>channel token</td><td>The same feed for one channel, without the API key</td></tr>
+<tr><td>GET</td><td><code>/feeds</code></td><td>API key</td><td>JSON list of known channels with their tokens and both URL forms</td></tr>
 <tr><td>GET</td><td><code>/media/&lt;fileId&gt;?sig=&hellip;</code></td><td>signature</td><td>Signed media proxy; the URLs are generated inside feeds</td></tr>
 <tr><td>POST</td><td><code>/admin/setup-webhook</code></td><td>API key</td><td>Register the Telegram webhook</td></tr>
 <tr><td>POST</td><td><code>/hook</code></td><td>Telegram secret header</td><td>Telegram webhook sink (called by Telegram)</td></tr>
@@ -1112,6 +1210,16 @@ const HELP_HTML = `<!doctype html>
 <pre>curl "https://HOST/rss/&lt;channel&gt;?key=YOUR_KEY"
 curl -H "Authorization: Bearer YOUR_KEY" "https://HOST/atom/&lt;channel&gt;"</pre>
 
+<h2>Feed tokens</h2>
+<p>
+  Give feed readers the token URL, so the API key never leaves your hands.
+  <code>GET /feeds</code> (API key) lists each channel's token and both URL forms.
+  A token is random, stored in D1, and opens only its own channel's default feed;
+  query options are ignored.
+</p>
+<pre>curl "https://HOST/feeds?key=YOUR_KEY"
+curl "https://HOST/rss/&lt;token&gt;"</pre>
+
 <h2>Channel</h2>
 <p>
   <code>&lt;channel&gt;</code> may be <code>@name</code>, <code>name</code>,
@@ -1119,6 +1227,7 @@ curl -H "Authorization: Bearer YOUR_KEY" "https://HOST/atom/&lt;channel&gt;"</pr
 </p>
 
 <h2>Feed options</h2>
+<p>These apply to requests that carry the API key; token URLs ignore them.</p>
 <table>
 <tr><th>Param</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><code>limit</code></td><td>${MAX_POSTS_PER_FEED}</td><td>Max posts in the feed (also the upper bound)</td></tr>
@@ -1185,25 +1294,27 @@ async function route(request, env, ctx) {
     );
   }
 
-  // everything below is key protected
-  if (!(await isAuthorized(request, url, env))) return unauthorized();
+  const isAdmin = await isAuthorized(request, url, env);
+  const isRead = method === "GET" || method === "HEAD";
+
+  // feeds take an API key or a channel token (handleFeed decides which)
+  const feed = parseFeedRoute(path);
+  if (feed) {
+    if (!isRead) return methodNotAllowed();
+    return handleFeed(request, env, ctx, feed, isAdmin);
+  }
+
+  // everything below needs API_KEY
+  if (!isAdmin) return unauthorized();
 
   if (path === "/admin/setup-webhook") {
     if (method !== "POST") return methodNotAllowed();
     return handleSetupWebhook(env, url);
   }
 
-  const isRead = method === "GET" || method === "HEAD";
-
   if (path === "/feeds") {
     if (!isRead) return methodNotAllowed();
-    return handleFeeds(env);
-  }
-
-  const feed = parseFeedRoute(path);
-  if (feed) {
-    if (!isRead) return methodNotAllowed();
-    return handleFeed(request, env, ctx, feed);
+    return handleFeeds(env, url.origin);
   }
 
   return json({ ok: false, error: "not found" }, 404);
