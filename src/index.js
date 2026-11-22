@@ -7,7 +7,7 @@
  *
  * Auth: env.API_KEY, sent as ?key=<key> or "Authorization: Bearer <key>", unlocks
  *       everything. A feed can instead be opened with its random channel token
- *       (/rss/<token>, stored in channels.feed_token): it reaches only that channel's
+ *       (/rss/:<token>, stored in channels.feed_token): it reaches only that channel's
  *       default feed, so readers never see API_KEY. /feeds lists the tokens. The webhook
  *       is guarded by Telegram's X-Telegram-Bot-Api-Secret-Token header
  *       (= env.WEBHOOK_SECRET). Media URLs embedded in feeds are HMAC-signed, so the
@@ -18,8 +18,8 @@
  *   GET  /health                    liveness probe
  *   GET  /rss/:channel              RSS 2.0                        (?key=)
  *   GET  /atom/:channel             Atom 1.0                       (?key=)
- *   GET  /rss/:token                RSS 2.0, one channel           (token only)
- *   GET  /atom/:token               Atom 1.0, one channel          (token only)
+ *   GET  /rss/:<token>              RSS 2.0, one channel           (token only)
+ *   GET  /atom/:<token>             Atom 1.0, one channel          (token only)
  *   GET  /feeds                     known channels + tokens (JSON) (?key=)
  *   GET  /media/:fileId?sig=        HMAC-signed media proxy
  *   POST /admin/setup-webhook       register the Telegram webhook  (?key=)
@@ -192,13 +192,11 @@ function unauthorized() {
 /* per-channel feed tokens                                              */
 /* ------------------------------------------------------------------ */
 
-const FEED_TOKEN_PATTERN = /^[0-9a-f]{32}$/;
-
 /*
  * A feed token is a random 128-bit value stored in channels.feed_token. D1 generates it
  * when the channel row is created (see upsertChannelStmt); migrate_feed_token.sql adds the
  * column and fills existing rows. It opens only that channel's default feed and does not
- * depend on API_KEY.
+ * depend on API_KEY. In a URL it is written with a leading colon: /rss/:<token>.
  */
 
 /** the channel row (key, username, chat_id) that owns this token, or null; indexed lookup */
@@ -282,7 +280,10 @@ function upsertChannelStmt(
 ) {
   return env.DB.prepare(
     // feed_token is set only on insert (random, by D1) and never touched on conflict
-    `INSERT INTO channels (key, chat_id, username, title, description, photo, link, fetched_at, webhook_at, updated_at, feed_token)
+    `INSERT INTO channels (
+      key, chat_id, username, title, description, photo, link,
+      fetched_at, webhook_at, updated_at, feed_token
+    )
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, lower(hex(randomblob(16))))
      ON CONFLICT(key) DO UPDATE SET
        chat_id     = COALESCE(NULLIF(excluded.chat_id, ''),     channels.chat_id),
@@ -370,7 +371,11 @@ async function persistPreview(env, channel, posts) {
     await env.DB.batch(stmts.slice(i, i + 100));
 }
 
-/** cron: drop posts outside the retention window and above the per-channel cap */
+/**
+ * cron: drop posts outside the retention window and above the per-channel cap.
+ * Channels are kept on purpose, so a channel's feed token never changes under its readers;
+ * the README explains how to find outdated channels and remove them by hand.
+ */
 async function cleanup(env) {
   const days = positiveNumber(env.FEED_DAYS, DEFAULT_FEED_WINDOW_DAYS);
   const cutoffIso = new Date(Date.now() - days * MS_PER_DAY).toISOString();
@@ -938,8 +943,9 @@ async function purgeChannelCache(
 }
 
 /**
- * Serves /rss|atom/<segment>. The segment is either a channel (needs API_KEY) or a
- * channel token (no key needed, opens only that channel's default feed).
+ * Serves /rss|atom/<segment>. "/rss/:<token>" opens one channel's default feed without a
+ * key; "/rss/<channel>" needs API_KEY. The colon is what tells them apart: it cannot occur
+ * in a channel name, so a name is never mistaken for a token or the other way round.
  */
 async function handleFeed(
   request,
@@ -950,33 +956,30 @@ async function handleFeed(
 ) {
   const url = new URL(request.url);
   const options = getFeedOptions(request, url, env, isAdmin);
-  const cached = (key) =>
-    options.cacheable ? caches.default.match(key) : undefined;
 
-  // cache entries under a token key exist only for tokens that were already validated
-  const token = FEED_TOKEN_PATTERN.test(segment) ? segment : "";
-  const tokenCacheKey = cacheRequest(url.origin, format, `token:${token}`);
-  if (token) {
-    const hit = await cached(tokenCacheKey);
+  const isToken = segment.startsWith(":");
+  if (!isToken && !isAdmin) return unauthorized();
+
+  const token = isToken ? segment.slice(1) : "";
+  let ref = isToken ? null : normalizeChannelRef(segment);
+  if (ref && !ref.value) return json({ ok: false, error: "missing channel" }, 400);
+
+  // Token feeds are cached under the token, so a hit needs no database read. Such entries
+  // exist only for tokens that were valid when stored.
+  const cacheKey = cacheRequest(
+    url.origin,
+    format,
+    isToken ? `token:${token}` : ref.value,
+  );
+  if (options.cacheable) {
+    const hit = await caches.default.match(cacheKey);
     if (hit) return hit;
   }
 
-  const tokenChannel = token ? await findChannelByToken(env, token) : null;
-  if (!tokenChannel && !isAdmin) return unauthorized();
-
-  const ref = normalizeChannelRef(
-    tokenChannel
-      ? tokenChannel.username || tokenChannel.chat_id || tokenChannel.key
-      : segment,
-  );
-  if (!ref.value) return json({ ok: false, error: "missing channel" }, 400);
-
-  const cacheKey = tokenChannel
-    ? tokenCacheKey
-    : cacheRequest(url.origin, format, ref.value);
-  if (!tokenChannel) {
-    const hit = await cached(cacheKey);
-    if (hit) return hit;
+  if (isToken) {
+    const owner = await findChannelByToken(env, token);
+    if (!owner) return unauthorized();
+    ref = normalizeChannelRef(owner.username || owner.chat_id || owner.key);
   }
 
   const { channel, posts } = await loadFeed(env, ref, options);
@@ -1148,7 +1151,7 @@ async function handleFeeds(env, origin) {
     const token = channel.feed_token;
     const name = encodeURIComponent(channel.username || channel.chat_id);
     const urls = (format) => ({
-      by_token: `${origin}/${format}/${token}`,
+      by_token: `${origin}/${format}/:${token}`,
       by_name: `${origin}/${format}/${name}?key=YOUR_KEY`,
     });
     return {
@@ -1193,7 +1196,7 @@ const HELP_HTML = `<!doctype html>
 <tr><td>GET</td><td><code>/health</code></td><td>none</td><td>Liveness probe</td></tr>
 <tr><td>GET</td><td><code>/rss/&lt;channel&gt;</code></td><td>API key</td><td>RSS 2.0 feed</td></tr>
 <tr><td>GET</td><td><code>/atom/&lt;channel&gt;</code></td><td>API key</td><td>Atom 1.0 feed</td></tr>
-<tr><td>GET</td><td><code>/rss/&lt;token&gt;</code><br><code>/atom/&lt;token&gt;</code></td><td>channel token</td><td>The same feed for one channel, without the API key</td></tr>
+<tr><td>GET</td><td><code>/rss/:&lt;token&gt;</code><br><code>/atom/:&lt;token&gt;</code></td><td>channel token</td><td>The same feed for one channel, without the API key</td></tr>
 <tr><td>GET</td><td><code>/feeds</code></td><td>API key</td><td>JSON list of known channels with their tokens and both URL forms</td></tr>
 <tr><td>GET</td><td><code>/media/&lt;fileId&gt;?sig=&hellip;</code></td><td>signature</td><td>Signed media proxy; the URLs are generated inside feeds</td></tr>
 <tr><td>POST</td><td><code>/admin/setup-webhook</code></td><td>API key</td><td>Register the Telegram webhook</td></tr>
@@ -1215,10 +1218,11 @@ curl -H "Authorization: Bearer YOUR_KEY" "https://HOST/atom/&lt;channel&gt;"</pr
   Give feed readers the token URL, so the API key never leaves your hands.
   <code>GET /feeds</code> (API key) lists each channel's token and both URL forms.
   A token is random, stored in D1, and opens only its own channel's default feed;
-  query options are ignored.
+  query options are ignored. Write it with a leading colon: the colon is what marks a
+  token, and a channel name can never contain one.
 </p>
 <pre>curl "https://HOST/feeds?key=YOUR_KEY"
-curl "https://HOST/rss/&lt;token&gt;"</pre>
+curl "https://HOST/rss/:&lt;token&gt;"</pre>
 
 <h2>Channel</h2>
 <p>

@@ -71,8 +71,8 @@ curl "HOST/feeds?key=KEY"
 
 | Goal | URL |
 | --- | --- |
-| RSS, token (for readers) | `HOST/rss/<token>` |
-| Atom, token (for readers) | `HOST/atom/<token>` |
+| RSS, token (for readers) | `HOST/rss/:<token>` |
+| Atom, token (for readers) | `HOST/atom/:<token>` |
 | RSS, by name | `HOST/rss/telegram?key=KEY` |
 | Atom, by name | `HOST/atom/telegram?key=KEY` |
 | Last 7 days, 20 items | `HOST/rss/telegram?key=KEY&days=7&limit=20` |
@@ -90,7 +90,7 @@ curl "HOST/feeds?key=KEY"
 | --- | --- | --- | --- |
 | `GET` | `/` · `/health` | – | help page · health probe |
 | `GET` | `/rss/:channel` · `/atom/:channel` | key | RSS / Atom feed |
-| `GET` | `/rss/:token` · `/atom/:token` | channel token | the same feed for one channel, no key needed |
+| `GET` | `/rss/:<token>` · `/atom/:<token>` | channel token | the same feed for one channel, no key needed |
 | `GET` | `/feeds` | key | JSON list of known channels with their tokens and both URL forms |
 | `GET` | `/media/:fileId?sig=…` | signature | photo proxy for webhook posts |
 | `POST` | `/admin/setup-webhook` | key | register the Telegram webhook |
@@ -117,7 +117,8 @@ parameters. A key containing `=`, `&`, `+` or `%` must be percent-encoded in a U
 header needs no encoding. Without a valid key you get `401` and no channel content.
 
 **Channel tokens** are the only thing that works without the key, and only for
-`/rss/<token>` and `/atom/<token>`. A token is a random 128-bit value (32 hex characters)
+`/rss/:<token>` and `/atom/:<token>`; the leading colon is what marks a token (a channel name
+can never contain one), and `%3A` works too. A token is a random 128-bit value (32 hex characters)
 stored in `channels.feed_token`. D1 creates it when the channel is first stored and it never
 changes by itself. It opens that one channel's default feed, and the feed's `self` link
 carries the token, never the key. A token is a bearer secret like the key, only narrower:
@@ -178,6 +179,10 @@ each channel to its newest `MAX_POSTS`. `?days=N` narrows the window per request
 above `FEED_DAYS` only returns what is still stored. Custom `days`, `limit` or `refresh`
 bypass the edge cache.
 
+The cron removes **posts only**. Channels are never removed automatically, so a channel's
+feed token stays the same; see [Outdated channels](#outdated-channels) for cleaning up by
+hand.
+
 > The window is strict: a channel that posts less often than every 30 days returns an
 > **empty feed**. Raise `FEED_DAYS` for quiet channels (for example `365`) and keep
 > `MAX_POSTS` above `posts_per_day × FEED_DAYS`.
@@ -199,6 +204,56 @@ bypass the edge cache.
 A preview page holds about 20 posts and every refresh starts from the newest post, so one
 backfill reaches roughly 200 posts. Public channels only; private channels fill up through
 the webhook.
+
+## Outdated channels
+
+Old posts expire on their own, but a channel row stays after its last post is gone. That
+keeps feed tokens stable, and it means channels nobody uses any more stay in `/feeds` until
+you remove them. Check now and then, and clean up by hand.
+
+**Find them.** A channel is outdated when nothing has refreshed it for longer than
+`FEED_DAYS` (replace `30` with your value) and it has no posts left. `last_activity` is the
+last scrape or webhook post; a public channel that a reader keeps polling is re-scraped about
+every `CACHE_TTL` seconds, so it does not show up here.
+
+```bash
+./deploy.sh d1 execute telegram-rss --remote --command "SELECT key, title,
+  datetime(updated_at / 1000, 'unixepoch') AS last_activity,
+  (SELECT COUNT(*) FROM posts WHERE posts.chan = channels.key) AS posts
+FROM channels
+WHERE updated_at < (strftime('%s', 'now') - 30 * 86400) * 1000
+ORDER BY updated_at"
+```
+
+Rows with `posts = 0` are the ones to remove. Without wrangler, the same idle list (but no post
+counts) comes from `/feeds`:
+
+```bash
+curl -s "HOST/feeds?key=KEY" | jq -r '.channels[]
+  | select(.updated_at < (now - 30 * 86400) * 1000)
+  | [.key, .title, (.updated_at / 1000 | todate)] | @tsv'
+```
+
+**Remove one channel.** Use the `key` from the lists above (the lowercase username, or
+`id:<number>` for a private channel). Delete its posts first, then the channel:
+
+```bash
+./deploy.sh d1 execute telegram-rss --remote --command "DELETE FROM posts WHERE chan = 'telegram'"
+./deploy.sh d1 execute telegram-rss --remote --command "DELETE FROM channels WHERE key = 'telegram'"
+```
+
+**Remove every outdated channel at once** (idle for the whole window and no posts left):
+
+```bash
+./deploy.sh d1 execute telegram-rss --remote --command "DELETE FROM channels
+WHERE updated_at < (strftime('%s', 'now') - 30 * 86400) * 1000
+  AND NOT EXISTS (SELECT 1 FROM posts WHERE posts.chan = channels.key)"
+```
+
+A removed channel disappears from `/feeds` and its token URL returns `401`; the edge cache
+may still serve its old feed for up to `CACHE_TTL` seconds. If the channel is requested again
+by name (public) or the bot receives a new post (private), it is stored again with a **new
+token**, so readers need the new URL from `/feeds`.
 
 ---
 
@@ -232,7 +287,7 @@ curl "http://localhost:8787/rss/telegram?key=change-me"
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Reader shows the "Telegram → RSS" help text | it fetched `/`, so the URL has no route | subscribe to the full URL: `HOST/rss/<channel>?key=…` |
-| `401` JSON | missing or wrong key, or a token that was regenerated | check `?key=` or the Bearer header against `API_KEY` (encode special characters); for a token URL take the current one from `/feeds` |
+| `401` JSON | missing or wrong key, or a token that was regenerated | check `?key=` or the Bearer header against `API_KEY` (encode special characters); for a token URL take the current one from `/feeds` and keep the leading colon: `/rss/:<token>` |
 | `500` with `no such column: feed_token` | the migration has not been run | `./deploy.sh d1 execute telegram-rss --remote --file=migrate_feed_token.sql` |
 | A channel is missing from `/feeds` | it has not been fetched yet | open `HOST/rss/<channel>?key=KEY` once (private channel: wait for the bot's first post) |
 | `404` "channel not found" | wrong name, no public preview, or a private channel the bot has not seen yet | check the username; for private channels add the bot as admin, register the webhook and wait for a post |
